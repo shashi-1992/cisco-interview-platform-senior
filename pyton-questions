@@ -1,0 +1,643 @@
+# Python interview questions (3 parts)
+
+Sources: Part 1 aligns with [Interview Coding Questions & Answers — Python (Medium)](https://medium.com/@priyankar9805/interview-coding-questions-answers-python-878af839497f) — first eight topics only.
+
+---
+
+## Part 1 — Core coding (8) — Q & A
+
+### 1. Find all permutations of a string
+
+**Q:** Given a string (e.g. `"ABC"`), print all permutations.
+
+**A:**
+
+```python
+from itertools import permutations
+
+s = "ABC"
+for p in permutations(s):
+    print("".join(p), end="")
+# Output: ABCACBBACBCACABCBA
+```
+
+---
+
+### 2. Reverse a string
+
+**Q:** Reverse a string (e.g. `"PRASAD"` → `"DASARP"`).
+
+**A:**
+
+```python
+s = "PRASAD"
+
+# Slicing
+rev = s[::-1]
+print("Using String slicing :", rev)
+
+# For loop
+rev2 = ""
+for ch in s:
+    rev2 = ch + rev2
+print("Using for loop :", rev2)
+```
+
+---
+
+### 3. Swap two numbers without a third variable
+
+**Q:** Swap `a` and `b` without an extra variable.
+
+**A:**
+
+```python
+a, b = 10, 20
+
+# Idiomatic (tuple unpacking)
+a, b = b, a
+print("Using in-build syntax : a is", a, "& b is", b)
+
+# Arithmetic (integers only; watch overflow in theory in other languages)
+a, b = 10, 20
+a = a + b
+b = a - b
+a = a - b
+print("Using arithmetic operations : a is", a, "& b is", b)
+```
+
+---
+
+### 4. Fibonacci sequence
+
+**Q:** Print the first `n` Fibonacci numbers (example: first 5 → `0 1 1 2 3`).
+
+**A:**
+
+```python
+def fibonacci(n):
+    a, b = 0, 1
+    for _ in range(n):
+        print(a, end="")
+        a, b = b, a + b
+
+fibonacci(5)  # 01123
+```
+
+---
+
+### 5. Sum of all digits in a number
+
+**Q:** Given an integer, return the sum of its digits (e.g. `203` → `5`).
+
+**A:**
+
+```python
+n = 203
+total = 0
+for ch in str(abs(n)):
+    total += int(ch)
+print("Sum of digits :", total)
+```
+
+---
+
+### 6. Palindrome check
+
+**Q:** Check if a string is a palindrome (reads same forwards and backwards).
+
+**A:**
+
+```python
+s = "RADAR"
+clean = s.lower().replace(" ", "")
+is_pal = clean == clean[::-1]
+print(s, "is a Palindrome" if is_pal else "is not a Palindrome")
+```
+
+---
+
+### 7. Factorial
+
+**Q:** Compute `n!` (e.g. `5! = 120`).
+
+**A:**
+
+```python
+def factorial(n):
+    if n < 0:
+        raise ValueError("n must be non-negative")
+    result = 1
+    for i in range(2, n + 1):
+        result *= i
+    return result
+
+print("5! =", factorial(5))
+```
+
+---
+
+### 8. Copy matching files from two folders into a third
+
+**Q:** Copy files named like `FileA.txt`, `FileB.txt`, … from `FolderA` and `FolderB` into `FolderC` (concept: glob or pattern, merge two sources, single destination).
+
+**A:**
+
+```python
+import shutil
+from pathlib import Path
+
+folder_a = Path("FolderA")
+folder_b = Path("FolderB")
+folder_c = Path("FolderC")
+folder_c.mkdir(parents=True, exist_ok=True)
+
+pattern = "File*.txt"
+for src_dir in (folder_a, folder_b):
+    if not src_dir.is_dir():
+        continue
+    for f in src_dir.glob(pattern):
+        shutil.copy2(f, folder_c / f.name)
+```
+
+Adjust `pattern` if your naming differs (e.g. `*.txt` only).
+
+---
+
+## Part 2 — “Real world” / senior-style (code for each topic)
+
+Each block is a **self-contained pattern** you can trim for interviews. Dependencies are noted inline.
+
+---
+
+### Topic A — Standard library: `os`, `sys`, `json`, `re`, `subprocess`
+
+**Q:** CLI: load JSON config, find log files under a root, filter names with regex, run `sha256sum` (or `shasum`) on each match with timeout.
+
+**Code (`stdlib` only; uses `shasum` on macOS, `sha256sum` on Linux if you swap `checksum_cmd`):**
+
+```python
+#!/usr/bin/env python3
+"""scan_logs_checksum.py <config.json> — Topic A demo."""
+from __future__ import annotations
+
+import json
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+
+LOG_NAME = re.compile(r"^app-\d{4}-\d{2}-\d{2}\.log$")
+
+
+def usage() -> None:
+    print("usage: scan_logs_checksum.py <config.json>", file=sys.stderr)
+
+
+def main() -> int:
+    if len(sys.argv) != 2:
+        usage()
+        return 2
+    cfg_path = Path(sys.argv[1])
+    if not cfg_path.is_file():
+        print(f"config not found: {cfg_path}", file=sys.stderr)
+        return 2
+
+    try:
+        cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as e:
+        print(f"invalid JSON in {cfg_path}: {e}", file=sys.stderr)
+        return 1
+
+    root = Path(cfg["log_root"])
+    # macOS: shasum -a 256 ; Linux: sha256sum
+    checksum_cmd = cfg.get("checksum_cmd", ["shasum", "-a", "256"])
+    timeout = int(cfg.get("checksum_timeout_sec", 30))
+
+    matches: list[Path] = []
+    for path in root.rglob("*.log"):
+        if LOG_NAME.match(path.name):
+            matches.append(path)
+
+    for path in sorted(matches):
+        try:
+            proc = subprocess.run(
+                [*checksum_cmd, str(path)],
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired:
+            print(f"TIMEOUT {path}", file=sys.stderr)
+            continue
+        if proc.returncode != 0:
+            print(f"FAIL {path}: {proc.stderr.strip()}", file=sys.stderr)
+            continue
+        print(f"{path}: {proc.stdout.splitlines()[0] if proc.stdout else ''}")
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+```
+
+Example `config.json`:
+
+```json
+{
+  "log_root": "/var/log/myapp",
+  "checksum_cmd": ["shasum", "-a", "256"],
+  "checksum_timeout_sec": 15
+}
+```
+
+---
+
+### Topic B — Reliability: logging, retries, bounded backoff (API + DB sketch)
+
+**Q:** Batch job: HTTP GET then DB insert; handle **503** and transient DB errors with retries and structured logging.
+
+**Code (stdlib + `urllib` to avoid mandatory `requests`; swap for `requests` in production):**
+
+```python
+#!/usr/bin/env python3
+"""reliable_batch.py — Topic B demo: logging + exponential backoff + jitter."""
+from __future__ import annotations
+
+import json
+import logging
+import random
+import time
+import urllib.error
+import urllib.request
+from typing import Any, Callable
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+)
+log = logging.getLogger("batch")
+
+
+def fetch_json(url: str, timeout: float = 10.0) -> Any:
+    req = urllib.request.Request(url, headers={"Accept": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode())
+
+
+def is_retryable_http(err: BaseException) -> bool:
+    if isinstance(err, urllib.error.HTTPError):
+        return err.code in (408, 429, 502, 503, 504)
+    return isinstance(err, (urllib.error.URLError, TimeoutError, OSError))
+
+
+def with_retries(
+    op: Callable[[], Any],
+    *,
+    max_attempts: int = 5,
+    base_sec: float = 0.5,
+    max_sec: float = 30.0,
+    retryable: Callable[[BaseException], bool],
+) -> Any:
+    last: BaseException | None = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return op()
+        except Exception as e:  # noqa: BLE001 — demo; narrow in prod
+            last = e
+            if not retryable(e) or attempt == max_attempts:
+                log.exception("giving up attempt=%s err=%s", attempt, e)
+                raise
+            sleep = min(max_sec, base_sec * (2 ** (attempt - 1)))
+            sleep *= 0.5 + random.random()  # jitter
+            log.warning("retry attempt=%s sleep=%.2fs err=%s", attempt, sleep, e)
+            time.sleep(sleep)
+    assert last is not None
+    raise last
+
+
+def process_record(record_id: str, api_url: str) -> None:
+    data = with_retries(lambda: fetch_json(f"{api_url}/records/{record_id}"), retryable=is_retryable_http)
+    log.info("fetched record_id=%s keys=%s", record_id, list(data)[:5])
+
+    def db_insert() -> None:
+        # Replace with real DB; simulate deadlock with a custom error type in real code
+        pass
+
+    try:
+        with_retries(db_insert, retryable=lambda e: "deadlock" in str(e).lower())
+    except Exception:
+        log.exception("db failed record_id=%s", record_id)
+        raise
+
+
+# if __name__ == "__main__":
+#     process_record("123", "https://api.example.com")
+```
+
+---
+
+### Topic C — `venv` + `pip` (reproducible env)
+
+**Q:** Isolate dependencies per project and match CI.
+
+**Commands (shell) — this *is* the “code” ops expects:**
+
+```bash
+# One-time per project
+python3 -m venv .venv
+source .venv/bin/activate   # Windows: .venv\Scripts\activate
+python -m pip install -U pip
+pip install -r requirements.txt
+pip freeze > requirements.lock.txt   # optional exact snapshot
+```
+
+**Minimal `requirements.txt` example:**
+
+```text
+requests==2.32.3
+```
+
+**CI snippet (GitHub Actions style):**
+
+```yaml
+- uses: actions/setup-python@v5
+  with:
+    python-version: "3.12"
+- run: python -m pip install -U pip && pip install -r requirements.txt
+- run: pytest -q
+```
+
+**Why not global `pip install`:** breaks OS Python tools, causes “works on my machine” drift, harder rollbacks.
+
+---
+
+### Topic D — Huge file: regex match count without loading whole file
+
+**Q:** Count lines matching a pattern in a multi-GB log.
+
+**Code:**
+
+```python
+#!/usr/bin/env python3
+"""stream_grep_count.py <path> <regex>"""
+from __future__ import annotations
+
+import re
+import sys
+from pathlib import Path
+
+
+def count_matches(path: Path, pattern: re.Pattern[str]) -> int:
+    n = 0
+    with path.open(encoding="utf-8", errors="replace") as f:
+        for line in f:
+            if pattern.search(line):
+                n += 1
+    return n
+
+
+def main() -> int:
+    if len(sys.argv) != 3:
+        print("usage: stream_grep_count.py <file> <regex>", file=sys.stderr)
+        return 2
+    path = Path(sys.argv[1])
+    pat = re.compile(sys.argv[2])
+    print(count_matches(path, pat))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+```
+
+---
+
+## Part 3 — Platform style (Exotel-like): **1× OTEL + 4× other real-time patterns** (all with code)
+
+Use these as **story + snippet**: OTEL for traces, then archival, reliable upload, webhooks, queue/metrics glue typical in CPaaS / telecom backends.
+
+**Install note for OTEL example:**
+
+```bash
+pip install opentelemetry-api opentelemetry-sdk opentelemetry-exporter-otlp-proto-grpc
+```
+
+---
+
+### Example 1 — OpenTelemetry: trace a request + OTLP export (real-time path)
+
+**What it shows:** create a tracer, span around work, export to an OTLP collector (Jaeger/Tempo/Grafana Agent).
+
+```python
+"""otel_span_export.py — run with OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317"""
+from opentelemetry import trace
+from opentelemetry.sdk.resources import Resource
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+
+
+def setup_tracing(service_name: str) -> None:
+    resource = Resource.create({"service.name": service_name})
+    provider = TracerProvider(resource=resource)
+    exporter = OTLPSpanExporter(insecure=True)  # set TLS/creds in prod
+    provider.add_span_processor(BatchSpanProcessor(exporter))
+    trace.set_tracer_provider(provider)
+
+
+def handle_call(call_id: str) -> None:
+    tracer = trace.get_tracer(__name__)
+    with tracer.start_as_current_span("voice.call.handle") as span:
+        span.set_attribute("call.id", call_id)
+        # ... business logic ...
+        span.add_event("media.negotiated")
+
+
+if __name__ == "__main__":
+    setup_tracing("cpaas-worker")
+    handle_call("call-abc-123")
+```
+
+**Interview line:** correlate logs with `trace_id` / `span_id` in structured log fields (OTEL logging bridge or manual injection).
+
+---
+
+### Example 2 — Log archival: rotate, gzip, stage for upload (cron-friendly)
+
+**Real-time angle:** nightly job picks **closed** log files, compresses, moves to a staging dir for `aws s3 cp` / `gsutil` / internal NFS.
+
+```python
+#!/usr/bin/env python3
+"""archive_logs.py — gzip *.log older than 1h into staging/, idempotent by skip-if-.gz-exists."""
+from __future__ import annotations
+
+import gzip
+import shutil
+import time
+from pathlib import Path
+
+SRC = Path("/var/log/myapp")
+STAGING = Path("/var/log/myapp/staging")
+MIN_AGE_SEC = 3600
+
+
+def archive() -> None:
+    STAGING.mkdir(parents=True, exist_ok=True)
+    now = time.time()
+    for logfile in SRC.glob("*.log"):
+        if not logfile.is_file():
+            continue
+        if now - logfile.stat().st_mtime < MIN_AGE_SEC:
+            continue
+        out = STAGING / (logfile.name + ".gz")
+        if out.exists():
+            continue
+        with logfile.open("rb") as fin, gzip.open(out, "wb", mtime=0) as fout:
+            shutil.copyfileobj(fin, fout)
+        logfile.unlink()
+        print("archived", out)
+
+
+if __name__ == "__main__":
+    archive()
+```
+
+---
+
+### Example 3 — Reliable push to backup: retries + `.done` marker (at-least-once safe)
+
+**Real-time angle:** worker uploads `staging/*.gz`; only writes `file.gz.done` after HTTP 200; retries on 5xx with backoff; **never** deletes `.gz` until success.
+
+```python
+#!/usr/bin/env python3
+"""reliable_upload.py — upload with backoff; touch .done only on success."""
+from __future__ import annotations
+
+import random
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+STAGING = Path("/var/log/myapp/staging")
+UPLOAD_URL = "https://backup.example.com/ingest"  # placeholder
+
+
+def upload_file(path: Path) -> None:
+    done = path.with_name(path.name + ".done")
+    if done.exists():
+        return
+    data = path.read_bytes()
+    for attempt in range(1, 6):
+        try:
+            req = urllib.request.Request(
+                UPLOAD_URL,
+                data=data,
+                method="PUT",
+                headers={"Content-Type": "application/gzip"},
+            )
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                if 200 <= resp.status < 300:
+                    done.write_text("ok\n")
+                    return
+        except urllib.error.HTTPError as e:
+            if e.code >= 500 and attempt < 5:
+                time.sleep(min(30, 0.5 * (2 ** (attempt - 1))) * (0.5 + random.random()))
+                continue
+            raise
+
+
+def main() -> None:
+    for gz in sorted(STAGING.glob("*.gz")):
+        upload_file(gz)
+
+
+if __name__ == "__main__":
+    main()
+```
+
+---
+
+### Example 4 — Real-time webhooks: HTTP endpoint for delivery / CDR callbacks
+
+**Real-time angle:** carriers or messaging partners POST delivery receipts; validate signature (HMAC), enqueue idempotently, return `200` fast.
+
+```python
+"""webhook_server.py — pip install flask"""
+from __future__ import annotations
+
+import hashlib
+import hmac
+import logging
+from flask import Flask, request, abort
+
+log = logging.getLogger("webhook")
+app = Flask(__name__)
+WEBHOOK_SECRET = b"change-me-in-vault"
+
+
+@app.post("/webhooks/delivery")
+def delivery():
+    raw = request.get_data()
+    sig = request.headers.get("X-Signature", "")
+    expected = hmac.new(WEBHOOK_SECRET, raw, hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(sig, expected):
+        abort(401)
+    payload = request.get_json(force=True, silent=False)
+    event_id = payload.get("event_id")
+    log.info("delivery event_id=%s", event_id)
+    # TODO: idempotent write to queue/DB by event_id
+    return {"ok": True}, 200
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
+    app.run(host="127.0.0.1", port=8080)
+```
+
+---
+
+### Example 5 — Small metrics / health sidecar: Prometheus text + liveness
+
+**Real-time angle:** glue service exposes `/metrics` (process stats) and `/healthz` for k8s probes; no heavy framework.
+
+```python
+"""metrics_sidecar.py — pip install prometheus_client"""
+from __future__ import annotations
+
+from prometheus_client import Counter, start_http_server
+import time
+
+REQUESTS = Counter("worker_jobs_total", "Jobs processed", ["status"])
+
+
+def main() -> None:
+    start_http_server(9100)
+    while True:
+        # simulate work
+        REQUESTS.labels(status="ok").inc()
+        time.sleep(5)
+
+
+if __name__ == "__main__":
+    main()
+```
+
+---
+
+### Quick map (for interviews)
+
+| # | Pattern | Where it shows up |
+|---|---------|-------------------|
+| 1 | OTEL traces → OTLP | Services talking to collector; latency debugging |
+| 2 | gzip + staging | Log rotation before object-store / tape workflow |
+| 3 | retry + `.done` marker | Reliable backup push without silent data loss |
+| 4 | signed webhooks | SMS/voice delivery receipts, partner callbacks |
+| 5 | Prometheus + health | Small Python workers in k8s / VM fleets |
+
+---
+
+*Rehearse Part 1 timed; Part 2 by walking through failure modes; Part 3 by tying each snippet to something you shipped or operated.*
