@@ -1,0 +1,232 @@
+# Ansible — simple interview notes (Getafix `trunk/ansible` + Voicebot on-prem)
+
+This version is **short and plain**. Each example says **what it does** in normal words.
+
+If someone asks about **Jenkins** or **Terraform**, one line is enough: *“CI can run `ansible-playbook`; Terraform might create the VM; Ansible configures the OS and services.”*
+
+---
+
+## 1. What Ansible is (one sentence)
+
+You describe **what state you want** on a server (package installed, file content, service running). Ansible connects over SSH and **applies** that state. Running it twice should **not** keep redoing the same work — that idea is called **idempotency**.
+
+---
+
+## 2. Folder structure — **`xotel_code/getafix/trunk/ansible`** (OTel / shared Ansible)
+
+Ansible for things like the **OTel collector** lives under **Getafix**, not `exotel_configs`. A common layout (matches the idea of **`roles/otel-collector`** on a branch like **`feature/otel-collector`**):
+
+```text
+xotel_code/
+└── getafix/
+    └── trunk/
+        └── ansible/
+            ├── ansible.cfg              # roles_path, inventory, defaults
+            ├── otel.yml                 # top-level playbook (example name)
+            ├── hosts                    # default inventory
+            ├── hosts.qa                 # optional: env-specific inventory
+            ├── env-vars/
+            │   ├── qa                   # vars loaded per env (see playbook)
+            │   └── prod
+            └── roles/
+                └── otel-collector/      # role you develop on feature branch
+                    ├── defaults/
+                    │   └── main.yml     # default ports, memory, exporters, etc.
+                    ├── tasks/
+                    │   └── main.yml     # install binary, template config, systemd
+                    ├── handlers/
+                    │   └── main.yml     # restart collector
+                    ├── meta/
+                    │   └── main.yml
+                    ├── templates/
+                    │   ├── otel-config.yaml.j2
+                    │   └── otel-collector.service.j2
+                    └── vars/
+                        ├── qa             # optional extra overrides per env
+                        └── prod
+```
+
+**Branching (how you explain it)**
+
+- Day-to-day work on the role: branch **`feature/otel-collector`** (or your team’s name) — same paths under `trunk/ansible`, you commit role + playbook changes there.
+- When stable, merge into **`trunk`** (or `master`) so other playbooks and CI use the updated role.
+
+**Local clone in this workspace (same idea, shorter path):** `otel/otel-ansible/` → use it as the **mirror** when you study or demo.
+
+**What this is for**
+
+| Piece | Plain meaning |
+|-------|----------------|
+| **`ansible.cfg`** | Tells Ansible where **`roles/`** and **inventory** live. |
+| **`otel.yml`** | Which hosts run which **roles** (e.g. `otel-collector`). |
+| **`hosts` / `hosts.qa`** | Which servers get OTel; **groups** match `hosts:` in the playbook. |
+| **`env-vars/qa`**, **`env-vars/prod`** | Variables for **qa** vs **prod** (endpoints, memory, feature flags). |
+| **`roles/otel-collector`** | All steps to install and run the collector **reusably**. |
+
+---
+
+## 3. Folder structure — Voicebot **Ansible** on-prem (`setup-configs`) — unchanged
+
+This is the **Ansible** world for Voicebot (VMs). You keep **one folder per environment** under `setup-configs/`.
+
+```text
+voicebot_scripts/common_ansibles/
+├── roles/                          # shared Ansible roles
+│   ├── redis/
+│   ├── postgresql_replication/
+│   └── ...
+├── setup-configs/
+│   ├── prod/
+│   │   ├── inventory.yml
+│   │   ├── ansible.cfg
+│   │   ├── application-versions.txt
+│   │   ├── group_vars/
+│   │   │   └── all.yml
+│   │   └── <role_name>/main.yml
+│   └── dev/
+│       └── ... (same shape)
+└── sync-config.py                  # merge setup + roles → bundle → optional S3
+```
+
+**Flow in simple steps**
+
+1. Edit **`setup-configs/prod/`** (IPs, versions, vault secrets).
+2. **`sync-config.py`** builds the bundle and can **upload to S3**.
+3. **Jump server** runs **bootstrap** → downloads bundle from S3.
+4. Run **`deploy_dbs.sh`** / **`deploy_applications.sh`** → Ansible targets **DB / app VMs**.
+
+**How it relates to Getafix:** **Voicebot** = per-customer/per-env **`setup-configs`** + sync + jump server. **Getafix `trunk/ansible`** = shared automation (e.g. **otel-collector** role) that can be **reused** or **vendored** the way your org does it — different repo root, same Ansible concepts.
+
+---
+
+## 4. Smallest possible playbook (interview)
+
+```yaml
+---
+- name: Install and start nginx
+  hosts: webservers
+  become: true
+
+  tasks:
+    - name: Install nginx
+      ansible.builtin.apt:
+        name: nginx
+        state: present
+
+    - name: Start nginx
+      ansible.builtin.service:
+        name: nginx
+        state: started
+        enabled: true
+```
+
+**What this does**
+
+- **`hosts: webservers`** — only machines in the **`webservers`** group in inventory.
+- **`become: true`** — use sudo on the remote machine.
+- **First task** — ensure `nginx` is installed.
+- **Second task** — ensure the service is running and enabled on boot.
+
+---
+
+## 5. Inventory (where hosts are listed)
+
+```yaml
+all:
+  children:
+    webservers:
+      hosts:
+        web1:
+          ansible_host: 192.168.1.10
+        web2:
+          ansible_host: 192.168.1.11
+```
+
+**What this does** — defines two servers; the playbook can target **`webservers`**. **`ansible_host`** is the address Ansible uses for SSH.
+
+---
+
+## 6. Roles — path you care about for OTel
+
+```text
+xotel_code/getafix/trunk/ansible/roles/otel-collector/
+├── tasks/main.yml
+├── handlers/main.yml
+├── defaults/main.yml
+└── templates/
+    └── otel-config.yaml.j2
+```
+
+**Playbook that uses the role:**
+
+```yaml
+---
+- hosts: otel_hosts
+  become: true
+  roles:
+    - otel-collector
+```
+
+**What this does** — runs **`roles/otel-collector/tasks/main.yml`** on each **`otel_hosts`** machine. Variables default from **`defaults/main.yml`**, overridden by **`env-vars`** / **`group_vars`** / **`vars/qa`** etc., depending on how **`otel.yml`** is written.
+
+---
+
+## 7. OTel collector role — **`getafix/trunk/ansible/roles/otel-collector`**
+
+Same content as in this repo under **`otel/otel-ansible/roles/otel-collector/`**.
+
+| Piece | Purpose |
+|-------|---------|
+| **`defaults/main.yml`** | Ports (4317 gRPC, 4318 HTTP), memory limits, Jaeger/Prometheus toggles, etc. |
+| **`tasks/main.yml`** | Dirs → download **`otelcol-contrib`** (S3 or URL) → unpack with **`creates=`** → **template** config → **systemd** → enable. |
+| **`templates/otel-config.yaml.j2`** | Renders **`/etc/otel/config.yaml`** from variables. |
+| **`handlers`** | **Restart** service after config/binary change (once per play). |
+
+**Why Jinja2 (`*.j2`)** — one template; **qa** vs **prod** only change variables, not duplicate YAML.
+
+**Idempotency**
+
+- **`unarchive`** + **`creates: /usr/local/bin/otelcol-contrib`** → skip unpack if binary exists.
+- **`template`** + **`validate: 'otelcol-contrib validate --config=%s'`** → don’t write a broken config.
+
+---
+
+## 8. Important files (quick list)
+
+| File | Role |
+|------|------|
+| **`ansible.cfg`** | Inventory path, `roles_path`, output options. |
+| **Inventory** | Hosts and groups. |
+| **`group_vars/all.yml`** | Vars for all hosts (if used). |
+| **Playbook** (e.g. **`otel.yml`**) | Hosts + roles + `vars_files` for env. |
+| **Ansible Vault** | Encrypted secrets in Git. |
+
+```bash
+ansible-playbook otel.yml --syntax-check
+ansible-playbook otel.yml --check --diff
+ansible-playbook otel.yml -l otel_hosts
+```
+
+---
+
+## 9. Production issues (short stories)
+
+| Symptom | What to check |
+|---------|----------------|
+| **Playbook changes something every run** | Non-idempotent task; use modules + `creates` / `template`. |
+| **SSH fails** | `ansible_host`, user, key, firewall, jump `ProxyCommand`. |
+| **Collector didn’t restart** | **`notify`** / **handler**; task must report **changed**. |
+| **OTel not receiving traffic** | 4317/4318, bind address, firewall, TLS vs plain. |
+| **Wrong environment** | Wrong **`env-vars`** file, wrong **inventory**, or playbook pointed at **`hosts.qa`** instead of prod. |
+
+---
+
+## 10. One-minute interview sound bite
+
+- **Getafix:** **`xotel_code/getafix/trunk/ansible/`** holds playbooks and **`roles/otel-collector`**; work on **`feature/otel-collector`**, merge to trunk when ready.
+- **Voicebot on-prem:** **`setup-configs/<env>`** + **`sync-config.py`** + jump server + **`deploy_*.sh`** — same Ansible ideas, different repo layout.
+- **Roles + defaults + Jinja2** = reusable, environment-specific OTel installs without copy-paste.
+
+---
+
+*Cluster-side OpenSearch / Vector: see `OCI_OBSERVABILITY_OPENSEARCH_OTEL.md`. Kubernetes samples: `K8S_MANIFEST_SAMPLES.md`.*
