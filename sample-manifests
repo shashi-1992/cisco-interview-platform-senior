@@ -1,0 +1,695 @@
+# Kubernetes manifest samples (interview whiteboard / live-coding)
+
+Use these as **patterns** for a DevOps / platform interview (Kafka, AWS, persistence, CI/CD). Replace `example.com`, image names, and sizes for your story.
+
+**Convention:** `---` separates resources. All examples assume `apiVersion` current as of Kubernetes 1.28+ style.
+
+---
+
+## 1. Namespace
+
+```yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: webex-persistence
+  labels:
+    env: prod
+    team: persistence
+```
+
+---
+
+## 2. ConfigMap (app config + file snippet)
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: app-config
+  namespace: webex-persistence
+data:
+  LOG_LEVEL: "info"
+  KAFKA_BOOTSTRAP: "kafka-bootstrap:9092"
+  app.properties: |
+    server.port=8080
+    management.endpoints.web.exposure.include=health,metrics
+```
+
+---
+
+## 3. Secrets — plain K8s, then **AWS Secrets Manager** on EKS
+
+### 3.1 Plain `Secret` (dev / tests only)
+
+**Interview line:** Never commit real credentials; in prod use **AWS Secrets Manager** (or Parameter Store) with **IRSA** and sync/mount into the cluster.
+
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: app-db
+  namespace: webex-persistence
+type: Opaque
+stringData:
+  username: "appuser"
+  password: "REPLACE_ME"
+```
+
+---
+
+### 3.2 AWS Secrets Manager — how it fits Kubernetes
+
+| Approach | What it does | When you say it in interview |
+|----------|----------------|------------------------------|
+| **Secrets Store CSI driver** + **AWS provider** | Mounts secrets as files, or **syncs** into a native `Secret` via `secretObjects` | “Volume mount at `/mnt/secrets`, no secret in etcd plaintext” (synced Secret still exists if you enable `secretObjects`) |
+| **External Secrets Operator (ESO)** | Polls AWS and **creates/updates** a K8s `Secret` from ASM | “GitOps-friendly; `ExternalSecret` CR is in Git, not the credential” |
+
+**Both need:**
+
+1. Secret stored in **AWS Secrets Manager** (JSON key/value or plain string).
+2. **IAM policy** on the secret (least privilege: `GetSecretValue` on that ARN).
+3. **IRSA** — `ServiceAccount` annotated with `eks.amazonaws.com/role-arn` so the pod (or ESO controller) calls AWS without long-lived keys.
+
+**One-time (cluster admin):** install the CSI driver + AWS provider *or* install ESO; create the IAM role trust policy for OIDC provider.
+
+---
+
+### 3.3 Option A — Secrets Store CSI driver + `SecretProviderClass` (mount + optional K8s `Secret`)
+
+**Prereq:** [Secrets Store CSI Driver](https://secrets-store-csi-driver.sigs.k8s.io/) + [AWS Secrets and Config Provider](https://github.com/aws/secrets-store-csi-driver-provider-aws) installed on EKS.
+
+Create the secret in AWS (example name): `webex/persistence/prod/db` with JSON: `{"username":"appuser","password":"…"}`.
+
+**`SecretProviderClass`** — pulls from ASM and can **also** materialize a Kubernetes `Secret` for `envFrom` / `secretKeyRef`:
+
+```yaml
+apiVersion: secrets-store.csi.x-k8s.io/v1
+kind: SecretProviderClass
+metadata:
+  name: aws-db-secrets
+  namespace: webex-persistence
+spec:
+  provider: aws
+  parameters:
+    # Region must match the secret
+    region: us-east-1
+    # ASM secret id: name or full ARN
+    objects: |
+      - objectName: "webex/persistence/prod/db"
+        objectType: "secretsmanager"
+        jmesPath:
+          - path: username
+            objectAlias: username
+          - path: password
+            objectAlias: password
+  # Optional: also create a normal K8s Secret (for env vars without changing app)
+  secretObjects:
+    - secretName: app-db
+      type: Opaque
+      data:
+        - objectName: username
+          key: username
+        - objectName: password
+          key: password
+```
+
+**Pod / Deployment snippet** — CSI volume (files under mount path) *and* if `secretObjects` is set, same data appears as `Secret` `app-db`:
+
+```yaml
+# Inside Pod template spec:
+spec:
+  serviceAccountName: api-worker   # must use IRSA role allowed to read ASM
+  volumes:
+    - name: secrets-store-inline
+      csi:
+        driver: secrets-store.csi.k8s.io
+        readOnly: true
+        volumeAttributes:
+          secretProviderClass: aws-db-secrets
+  containers:
+    - name: api
+      volumeMounts:
+        - name: secrets-store-inline
+          mountPath: "/mnt/secrets-store"
+          readOnly: true
+      # If secretObjects created app-db:
+      env:
+        - name: DB_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: app-db
+              key: password
+```
+
+**File paths:** keys typically appear as `/mnt/secrets-store/username`, `/mnt/secrets-store/password` (confirm with provider docs for your version).
+
+---
+
+### 3.4 Option B — External Secrets Operator (`ExternalSecret`)
+
+**Prereq:** [External Secrets Operator](https://external-secrets.io/) installed; `SecretStore` or `ClusterSecretStore` points at AWS.
+
+**IRSA:** bind a role to the **ESO service account** (or use pod identity per ESO docs).
+
+```yaml
+apiVersion: external-secrets.io/v1beta1
+kind: SecretStore
+metadata:
+  name: aws-secretsmanager
+  namespace: webex-persistence
+spec:
+  provider:
+    aws:
+      service: SecretsManager
+      region: us-east-1
+      auth:
+        jwt:
+          serviceAccountRef:
+            name: external-secrets-sa
+---
+apiVersion: external-secrets.io/v1beta1
+kind: ExternalSecret
+metadata:
+  name: app-db
+  namespace: webex-persistence
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    name: aws-secretsmanager
+    kind: SecretStore
+  target:
+    name: app-db
+    creationPolicy: Owner
+  data:
+    - secretKey: username
+      remoteRef:
+        key: webex/persistence/prod/db
+        property: username
+    - secretKey: password
+      remoteRef:
+        key: webex/persistence/prod/db
+        property: password
+```
+
+Your `Deployment` keeps using `secretKeyRef` → `name: app-db` as in §4; ESO keeps `app-db` in sync with ASM on refresh.
+
+---
+
+### 3.5 IAM policy sketch (Secrets Manager read — attach to IRSA role)
+
+Replace account, region, and secret name/ARN.
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "GetDbSecret",
+      "Effect": "Allow",
+      "Action": ["secretsmanager:GetSecretValue", "secretsmanager:DescribeSecret"],
+      "Resource": "arn:aws:secretsmanager:us-east-1:123456789012:secret:webex/persistence/prod/db-*"
+    }
+  ]
+}
+```
+
+**Trust policy:** OIDC provider for the EKS cluster + `sts:AssumeRoleWithWebIdentity` for your namespace + `ServiceAccount` (CSI or ESO).
+
+---
+
+## 4. Deployment (HTTP service: probes, resources, env from ConfigMap/Secret)
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api-worker
+  namespace: webex-persistence
+  labels:
+    app: api-worker
+spec:
+  replicas: 3
+  revisionHistoryLimit: 5
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: api-worker
+  template:
+    metadata:
+      labels:
+        app: api-worker
+    spec:
+      serviceAccountName: api-worker
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        fsGroup: 10001
+      containers:
+        - name: api
+          image: 123456789012.dkr.ecr.us-east-1.amazonaws.com/webex/api:v1.2.3
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: LOG_LEVEL
+              valueFrom:
+                configMapKeyRef:
+                  name: app-config
+                  key: LOG_LEVEL
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: app-db
+                  key: password
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "512Mi"
+            limits:
+              cpu: "1"
+              memory: "1Gi"
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+```
+
+---
+
+## 5. Service (ClusterIP + headless for StatefulSets)
+
+**ClusterIP (default):**
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: api-worker
+  namespace: webex-persistence
+spec:
+  type: ClusterIP
+  selector:
+    app: api-worker
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+```
+
+**Headless (`None`) — stable DNS per pod:** `pod-name.service.namespace.svc.cluster.local`
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: kafka-broker-hl
+  namespace: webex-persistence
+spec:
+  clusterIP: None
+  selector:
+    app: kafka-broker
+  ports:
+    - name: kafka
+      port: 9092
+      targetPort: 9092
+```
+
+---
+
+## 6. Ingress (generic; AWS ALB Ingress Controller annotations example)
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: api-public
+  namespace: webex-persistence
+  annotations:
+    # Example for AWS Load Balancer Controller (ALB)
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/healthcheck-path: /health/ready
+spec:
+  ingressClassName: alb
+  rules:
+    - host: api.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: api-worker
+                port:
+                  number: 80
+```
+
+---
+
+## 7. StatefulSet (stateful workload: ordered rollout, stable identity)
+
+*Typical for Kafka brokers, ZooKeeper, etcd-style apps, or DB replicas.*
+
+```yaml
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: kafka-broker
+  namespace: webex-persistence
+spec:
+  serviceName: kafka-broker-hl
+  replicas: 3
+  selector:
+    matchLabels:
+      app: kafka-broker
+  template:
+    metadata:
+      labels:
+        app: kafka-broker
+    spec:
+      containers:
+        - name: kafka
+          image: apache/kafka:3.7.0
+          ports:
+            - containerPort: 9092
+              name: kafka
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/kafka/data
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: gp3
+        resources:
+          requests:
+            storage: 100Gi
+```
+
+**Interview talking points:** stable network ID `kafka-broker-0`, `kafka-broker-1`, …; ordered start/stop; PVC per pod via `volumeClaimTemplates`.
+
+---
+
+## 8. PersistentVolumeClaim (dynamic provisioning — EBS `gp3`)
+
+```yaml
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: app-data
+  namespace: webex-persistence
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: gp3
+  resources:
+    requests:
+      storage: 50Gi
+```
+
+---
+
+## 9. HorizontalPodAutoscaler (CPU + memory)
+
+```yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: api-worker
+  namespace: webex-persistence
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: api-worker
+  minReplicas: 3
+  maxReplicas: 20
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 80
+```
+
+---
+
+## 10. PodDisruptionBudget (availability during node drains / upgrades)
+
+```yaml
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: api-worker-pdb
+  namespace: webex-persistence
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: api-worker
+```
+
+**Alternative:** `maxUnavailable: 1` for batch-style workloads.
+
+---
+
+## 11. CronJob (scheduled tasks — backups, reports, partition reassign helper)
+
+```yaml
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: nightly-db-backup
+  namespace: webex-persistence
+spec:
+  schedule: "0 2 * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          restartPolicy: OnFailure
+          containers:
+            - name: backup
+              image: postgres:16-alpine
+              command: ["/bin/sh", "-c", "pg_dump -h $PGHOST -U $PGUSER $PGDATABASE | gzip -c > /tmp/dump.sql.gz"]
+              envFrom:
+                - secretRef:
+                    name: app-db
+```
+
+---
+
+## 12. Job (one-off migration / reindex)
+
+```yaml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: schema-migrate-20250403
+  namespace: webex-persistence
+spec:
+  backoffLimit: 2
+  ttlSecondsAfterFinished: 86400
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: migrate
+          image: 123456789012.dkr.ecr.us-east-1.amazonaws.com/webex/migrate:v1.0.0
+          args: ["upgrade", "--yes"]
+```
+
+---
+
+## 13. RBAC: ServiceAccount + Role + RoleBinding (namespace-scoped)
+
+```yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: api-worker
+  namespace: webex-persistence
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: api-worker-role
+  namespace: webex-persistence
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: ["app-db"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: api-worker-binding
+  namespace: webex-persistence
+subjects:
+  - kind: ServiceAccount
+    name: api-worker
+    namespace: webex-persistence
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: api-worker-role
+```
+
+**ClusterRole / ClusterBinding:** use for operators (e.g. node reader, CRD management) — mention in interview, don’t over-permission app pods.
+
+---
+
+## 14. NetworkPolicy (default deny + allow ingress from same namespace)
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: api-ingress-only
+  namespace: webex-persistence
+spec:
+  podSelector:
+    matchLabels:
+      app: api-worker
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress-nginx
+      ports:
+        - protocol: TCP
+          port: 8080
+  egress:
+    - to:
+        - namespaceSelector: {}
+      ports:
+        - protocol: TCP
+          port: 443
+    - to:
+        - podSelector:
+            matchLabels:
+              app: postgres
+      ports:
+        - protocol: TCP
+          port: 5432
+```
+
+**Note:** Requires a CNI that enforces NetworkPolicy (e.g. Calico, Cilium).
+
+---
+
+## 15. DaemonSet (node-level agent — log forwarders, node-exporter)
+
+```yaml
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: log-forwarder
+  namespace: webex-persistence
+spec:
+  selector:
+    matchLabels:
+      app: log-forwarder
+  template:
+    metadata:
+      labels:
+        app: log-forwarder
+    spec:
+      tolerations:
+        - operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: fluent-bit
+          image: fluent/fluent-bit:3.0
+          volumeMounts:
+            - name: varlog
+              mountPath: /var/log
+              readOnly: true
+      volumes:
+        - name: varlog
+          hostPath:
+            path: /var/log
+            type: Directory
+```
+
+---
+
+## Quick interview map (JD → manifest)
+
+| JD theme | Manifests to mention |
+|----------|----------------------|
+| Kafka / streaming | `StatefulSet`, headless `Service`, `PDB`, storage, possibly Strimzi/operator (not shown—too long) |
+| AWS | ECR image refs, ALB `Ingress` annotations, `gp3` / CSI, IRSA (`serviceAccount` + IAM role annotation), **Secrets Manager** (CSI `SecretProviderClass` or ESO `ExternalSecret`) |
+| Postgres | `Deployment` or operator CR; `CronJob` backup; `Secret` + TLS |
+| CI/CD (Jenkins/GitHub) | Build pushes image → same Deployment tag bump; GitOps (Argo/Flux) applies these YAMLs |
+| Flask / SQLAlchemy / cache | `Deployment`, `Service`, `ConfigMap`, Redis as `Deployment`+`Service` or ElastiCache outside cluster |
+| SRE / HA | `PDB`, `HPA`, probes, rolling strategy, multiple AZ via node affinity (below) |
+
+---
+
+## Bonus: Pod affinity (spread across AZs — AWS)
+
+```yaml
+# Snippet inside Pod spec:
+spec:
+  affinity:
+    podAntiAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        - labelSelector:
+            matchExpressions:
+              - key: app
+                operator: In
+                values:
+                  - api-worker
+          topologyKey: topology.kubernetes.io/zone
+```
+
+---
+
+## Bonus: IRSA-style ServiceAccount annotation (EKS)
+
+```yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: api-worker
+  namespace: webex-persistence
+  annotations:
+    eks.amazonaws.com/role-arn: arn:aws:iam::123456789012:role/webex-api-worker-role
+```
+
+---
+
+*Practice: write `Deployment` + `Service` + `Ingress` + `PDB` from memory in under 10 minutes; narrate probes, resources, and rollout strategy as you go.*
