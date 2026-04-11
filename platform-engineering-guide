@@ -1,0 +1,259 @@
+# Kubernetes platform engineering — lifecycle, networking, service discovery, Istio, production
+
+Audience: **platform / DevOps / SRE** interviews and day-two operations (e.g. persistence, streaming, mesh-backed services).
+
+---
+
+## 1. Pod lifecycle (platform engineer view)
+
+### 1.1 Phases (what actually happens)
+
+| Phase | Meaning | Who drives it |
+|-------|---------|----------------|
+| **Pending** | Pod accepted by API server, **not** all conditions satisfied to run containers | Scheduler hasn’t placed it, or volumes/image pull not done |
+| **ContainerCreating** | Node assigned; pulling image, mounting volumes, creating sandbox | kubelet + runtime (containerd/CRI-O) |
+| **Running** | All init containers **done**; at least one app container **running** (or completed for Jobs) | kubelet |
+| **Succeeded / Failed** | Terminal (Job/CronJob batch semantics) | workload type |
+| **Unknown** | Node lost contact (often node problem) | kubelet heartbeat |
+
+**Pod conditions** (useful in debugging): `PodScheduled`, `Initialized`, `ContainersReady`, `Ready`.
+
+### 1.2 Scheduling → kubelet (happy path)
+
+1. **Admission**: quotas, policies, mutating webhooks (e.g. inject sidecar).
+2. **Scheduler**: picks a node (resources, affinity, taints/tolerations, topology spread).
+3. **Binding**: Pod → Node.
+4. **kubelet**: sync loop sees Pod; creates **pause** container (network + PID namespace holder); pulls image; starts **init containers** in order; starts app containers.
+5. **Readiness**: until readiness passes, **Service endpoints** exclude this Pod (if endpoints controller respects readiness).
+
+### 1.3 Termination (production-critical)
+
+**Order:** `SIGTERM` to PID 1 → optional **preStop** hook → **terminationGracePeriodSeconds** (default 30s) → `SIGKILL`.
+
+- **Platform concern:** apps must handle SIGTERM (drain connections, flush buffers). Java/Spring often need **longer** grace or explicit shutdown hooks.
+- **preStop:** sleep to let kube-proxy / EndpointSlice remove this Pod from Service before stopping (classic pattern for **connection draining** with external LBs).
+- **Force delete:** `kubectl delete pod --grace-period=0 --force` skips graceful path — only when node is broken and you accept risk.
+
+### 1.4 Probes (what interviewers expect you to separate)
+
+| Probe | Question it answers | Bad config symptom |
+|-------|---------------------|---------------------|
+| **liveness** | Is process **deadlocked** enough to restart? | Too short → restart storms; probes hitting expensive path → CPU/thundering herd |
+| **readiness** | Should this Pod receive **traffic**? | Wrong path → Pod never Ready; flapping → churn in load balancers |
+| **startup** (K8s 1.16+) | Slow-start apps (legacy JVM): suppress liveness until startup succeeds | Without it, liveness kills app before it’s up |
+
+**Platform rule of thumb:** readiness = **dependency + ability to serve**; liveness = **only** “would restart fix it?” — not “DB is down.”
+
+---
+
+## 2. Service discovery in Kubernetes
+
+### 2.1 What “discovery” means here
+
+Workloads find each other by **DNS name**, not by Pod IP (Pods are ephemeral).
+
+**Core pattern:** `Service` → stable **ClusterIP** (or headless) → **Endpoints** or **EndpointSlice** objects list **ready** Pod IPs → client resolves DNS → connects to Pod IP.
+
+### 2.2 Cluster DNS (CoreDNS)
+
+- **In-cluster name:** `my-svc.my-ns.svc.cluster.local` (short names `my-svc` work inside same namespace).
+- **CoreDNS** (kube-dns successor) answers from **Kubernetes API**-watched Services and EndpointSlices.
+- **Headless Service** (`clusterIP: None`): DNS returns **A records for each ready Pod** — used for **StatefulSets** (stable per-pod identity: `pod-0.my-sts.my-ns.svc.cluster.local`).
+
+### 2.3 kube-proxy’s role (not DNS)
+
+kube-proxy programs **node-level rules** (iptables, ipvs, or nftables) so traffic to **Service ClusterIP:port** is **DNAT’d** to a **backend Pod IP:targetPort**. DNS only resolves **name → ClusterIP**; forwarding is **kube-proxy** (or eBPF replacements on some CNIs).
+
+### 2.4 External discovery
+
+- **NodePort / LoadBalancer:** cloud LB → nodes; still backed by Endpoints.
+- **Ingress:** HTTP host/path routing; often paired with external DNS to Ingress LB IP.
+- **ExternalName:** CNAME to external host — quick hack, know limitations.
+
+### 2.5 Failure modes (discovery)
+
+| Symptom | Often |
+|---------|--------|
+| `NXDOMAIN` for service name | Wrong namespace, typo, Service not created |
+| DNS works, connection refused/timeout | **Endpoints empty** (no Ready pods), **NetworkPolicy** blocking, wrong **port** name/targetPort |
+| Intermittent 503 | **Subset** of backends unhealthy; **readiness** flapping; **rolling update** without PDB |
+
+---
+
+## 3. Kubernetes networking — depth for platform engineers
+
+### 3.1 Mental model: four “layers”
+
+1. **Container / Pod network** — one IP per Pod (CNI assigns), shared network namespace for containers in Pod.
+2. **Service abstraction** — stable virtual IP (ClusterIP) + port → load-balanced to Pods.
+3. **Ingress / Gateway** — L7 routing into cluster (often north-south).
+4. **Policy** — `NetworkPolicy` (L3/L4) if CNI supports it.
+
+### 3.2 East-west flow (Pod A → Service → Pod B)
+
+Simplified:
+
+1. App resolves `http://backend.ns.svc.cluster.local` → **ClusterIP** (via CoreDNS).
+2. Packet leaves Pod A toward **ClusterIP** (virtual, not attached to an interface on a real NIC — implementation-dependent).
+3. **CNI** routes Pod→Pod across nodes (overlay VXLAN/Geneve, or routed underlay).
+4. On destination node (or via overlay), traffic hits **kube-proxy** rules: DNAT **ClusterIP:port → PodB IP:targetPort**.
+5. **Pod B** receives connection on `targetPort`.
+
+**Trade-off — kube-proxy modes:**
+
+| Mode | Pros | Cons |
+|------|------|------|
+| **iptables** | Default, universal | Lots of rules at scale; linear search in older patterns; update latency |
+| **ipvs** | Better scalability, more schedulers | Extra kernel module; ops must understand ipvsadm |
+| **eBPF / CNI-specific** | Fast path, less kube-proxy | Vendor-specific (Cilium, etc.) |
+
+### 3.3 North-south (internet → cluster)
+
+Typical: **cloud LB** → **NodePort** or **target-type IP** (AWS LB controller) → **Pod** (or Ingress controller Pod). TLS may terminate at LB, Ingress, or mesh gateway.
+
+### 3.4 NetworkPolicy (when it bites)
+
+- Default in many clusters: **allow all**. Once you add a **deny-all** policy, you must explicitly allow **DNS** (kube-system/CoreDNS) and **egress to API** if needed.
+- **Debugging:** `kubectl describe networkpolicy`, CNI-specific tools (e.g. Cilium `cilium policy get`).
+
+### 3.5 Failure scenarios & what to check
+
+| Failure | Signals | Debugging mindset |
+|---------|---------|-------------------|
+| **No route to Pod IP** | Timeout | CNI pods unhealthy; node NotReady; subnet routing |
+| **ClusterIP unreachable** | Timeout from same node only | kube-proxy not running / rules stale |
+| **Works by IP, fails by Service name** | DNS | CoreDNS pods, `ndots`, wrong search domain |
+| **Works pod-to-pod, fails via Service** | kube-proxy / iptables | Check Endpoints, kube-proxy logs, rule count |
+| **TLS errors mid-mesh** | Wrong SAN, clock skew, cert rotation | Istio secrets, trust bundle |
+
+**Order of operations (debugging):** Endpoints Ready → DNS → NetworkPolicy → kube-proxy/CNI → application listen address (`0.0.0.0` vs `127.0.0.1`).
+
+### 3.6 Trade-offs summary
+
+| Choice | Trade-off |
+|--------|-----------|
+| Overlay vs routed underlay | Overlay: easier multi-cloud; extra encapsulation overhead |
+| Many small Services | More Endpoints churn; DNS and iptables/ipvs churn |
+| mTLS everywhere | Security vs latency, cert ops, blast radius of misconfig |
+
+---
+
+## 4. Istio (service mesh) — how it fits a platform role
+
+*Wording is generic (Istio 1.x concepts); your org may use managed mesh or different versions.*
+
+### 4.1 Control plane vs data plane
+
+| Plane | Components (typical) | Responsibility |
+|-------|----------------------|----------------|
+| **Control plane** | **istiod** (Pilot for xDS config, Citadel/istiod certs, Galley validation historically merged) | **Configuration**: what routes, policies, certs should exist — **not** in the hot data path of every byte |
+| **Data plane** | **Envoy** sidecar (or ambient ztunnel in newer models) in each Pod | **Intercepts TCP/HTTP** traffic; applies authz, retries, metrics, **mTLS** |
+
+**Interview one-liner:** *Control plane distributes config; data plane enforces it on every connection.*
+
+### 4.2 Traffic interception (sidecar model)
+
+1. Pod has **iptables** (or CNI redirect) rules: outbound/inbound traffic to Pod ports is **redirected to Envoy** listening on **localhost** (e.g. 15001/15006).
+2. Envoy **terminates** or **originates** TLS per **PeerAuthentication** / **DestinationRule**.
+3. Without mesh, app speaks plain HTTP to `localhost:15000` app port while sidecar handles service-to-service encryption.
+
+**Implication:** **init container** (`istio-init` or CNI plugin) must run **before** app — platform teams own ordering and **CAP_NET_ADMIN** implications.
+
+### 4.3 mTLS modes (Istio mental map)
+
+| Mode | Meaning |
+|------|---------|
+| **STRICT** | Only encrypted mesh identity; plaintext rejected (between meshed workloads) |
+| **PERMISSIVE** | Accept both — migration period |
+| **DISABLE** | No mesh mTLS (dangerous except edges) |
+
+**Certificates:** often short-lived certs keyed by **SPIFFE** identity (`spiffe://cluster/ns/sa/...`). **istiod** issues or rotates via SDS to Envoy.
+
+### 4.4 Config objects (what you actually edit)
+
+- **VirtualService:** routing, retries, timeouts, fault injection.
+- **DestinationRule:** subsets, TLS settings to upstream, outlier detection.
+- **PeerAuthentication / RequestAuthentication:** mTLS policy, JWT.
+- **AuthorizationPolicy:** L7 allow/deny.
+
+### 4.5 Control vs data plane — failure behavior
+
+| Failure | User-visible | Mitigation mindset |
+|---------|--------------|---------------------|
+| **istiod down** | **Existing** Envoys keep **last known config** (cached); **new** Pods may fail sidecar bootstrap | HA istiod; staging rollout |
+| **Envoy crash** | Pod not Ready; traffic shifts | Sidecar resource limits; panic logs |
+| **Cert expiry** | TLS handshake failures | Monitor `istiod` / cert metrics; rotation drills |
+| **Bad VirtualService** | 503/404 patterns | `istioctl analyze`, canary, gradual rollout |
+
+### 4.6 “How we use it in production” (talk track)
+
+- **Golden signals** at mesh: RED/USE on Envoy stats; distributed traces if **OpenTelemetry** + mesh integration.
+- **Progressive delivery:** subset routing + **DestinationRule** weights for canary.
+- **Zero-trust narrative:** identity per SA, **AuthorizationPolicy** by principal — not only network IP.
+- **Cost:** CPU/memory per sidecar — right-size workloads; evaluate **ambient mesh** if sidecar overhead is a bottleneck.
+
+---
+
+## 5. Real production scenarios (depth)
+
+### 5.1 Pod `CrashLoopBackOff`
+
+**Causes:** bad command, missing env/secret, **liveness** too aggressive, OOM in previous run, **permission** denied on volume.
+
+**Debug:** `kubectl logs --previous`, `describe pod` (events), **exit code** mapping, compare **limits** vs actual RSS.
+
+### 5.2 OOMKilled
+
+**Cause:** memory limit lower than peak (JVM heap + metaspace + native).
+
+**Platform:** raise limit **or** fix app; ensure **limits** set (no limit = noisy neighbor risk on node). **Vertical Pod Autoscaler** if available.
+
+### 5.3 ImagePullBackOff
+
+**Causes:** wrong tag, **ECR** auth, **imagePullSecrets**, registry outage, **arch** mismatch (arm vs amd64).
+
+**Debug:** `describe pod`, node can `crictl pull` with same creds.
+
+### 5.4 Deployment “stuck” during rollout
+
+**Causes:** **maxUnavailable** 0 + **PDB** blocking eviction; **readiness** never true; **ResourceQuota**; **priority** preemption.
+
+**Debug:** `kubectl rollout status`, `describe deployment`, **ReplicaSet** events, PDB `kubectl describe pdb`.
+
+### 5.5 Intermittent 503 / upstream connection failure
+
+**Causes:** subset of unhealthy backends; **connection pool** exhaustion; **Istio** outlier detection ejecting; **DB** saturation.
+
+**Debug:** compare **Endpoints** vs **Envoy clusters**; mesh dashboards; **tcpdump** / **istioctl proxy-config** last resort.
+
+### 5.6 Node NotReady → mass evictions
+
+**Causes:** kubelet death, disk pressure, **network partition**.
+
+**Platform:** **PDB** limits blast radius; **PodDisruptionBudgets** for stateful; **multi-AZ** node pools; **external** health checks for regional failures.
+
+### 5.7 DNS timeouts at scale
+
+**Causes:** CoreDNS **too few** replicas, **conntrack** exhaustion, **ndots** causing excessive queries.
+
+**Debug:** `dig` from debug Pod; CoreDNS metrics; **NodeLocal DNSCache** pattern on large clusters.
+
+### 5.8 Certificate / mTLS breakage after rotation
+
+**Causes:** **clock skew**, trust bundle mismatch, **workload** restarted before SDS push.
+
+**Debug:** compare **notAfter** on certs; **istioctl proxy-config secret**; NTP on nodes.
+
+---
+
+## 6. One-page interview “cheat sheet”
+
+1. **Lifecycle:** schedule → init → probes → **graceful termination** with preStop + SIGTERM.
+2. **Discovery:** **DNS** → **ClusterIP**; real backends = **Endpoints**; kube-proxy **DNAT**.
+3. **Networking:** CNI pod-to-pod; **Service** is virtual IP + kube-proxy; debug **DNS → Endpoints → policy → proxy**.
+4. **Istio:** **istiod** = config + certs; **Envoy** = enforce; **iptables** redirect; **mTLS** = identity + encryption; know **STRICT vs PERMISSIVE**.
+5. **Prod:** **CrashLoop** = logs --previous; **OOM** = limits/JVM; **rollout stuck** = PDB + readiness; **503** = backends + mesh subsets.
+
+---
+
+*Align stories with your JD: Kafka (headless, ordering), Postgres (connections, PDB), AWS (LB, IAM, ASM), Jenkins/GitOps (who applies these manifests).*
