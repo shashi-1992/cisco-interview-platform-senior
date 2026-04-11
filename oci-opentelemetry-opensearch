@@ -1,0 +1,170 @@
+# OCI (OKE) observability — OpenSearch + OpenTelemetry pipeline (platform view)
+
+This doc is derived from a **live OKE cluster** (`kubectl` context **`oke-observability`**) and written for **interviews** — setup flow, components, and how data moves. **No credentials** are stored here; rotate anything that was ever pasted in logs or ConfigMaps.
+
+---
+
+## 1. Switching to the OCI cluster with kubectl
+
+```bash
+kubectl config use-context oke-observability
+kubectl cluster-info
+kubectl get ns
+```
+
+**What you should see (example layout):** namespaces such as `opensearch`, `otel-vector`, `vector-collector`, `jaeger`, `kafka`, `ingress-nginx`, `cert-manager`.
+
+---
+
+## 2. High-level architecture (as a platform engineer would draw it)
+
+```text
+  [Apps / agents]
+        │  OTLP (gRPC 4317 / HTTP 4318), often TLS
+        ▼
+  ┌─────────────────────────────────────┐
+  │  Vector (StatefulSet) — otel-vector   │  ← Helm: receives OpenTelemetry, transforms
+  │  sources: opentelemetry               │
+  │  transforms: remap logs / traces     │
+  │  sinks: elasticsearch → OpenSearch   │
+  └─────────────────────────────────────┘
+        │  bulk index (daily indices)
+        ▼
+  ┌─────────────────────────────────────┐
+  │  OpenSearch cluster (StatefulSets)   │
+  │  master / data-hot / client tiers    │
+  │  + OpenSearch Dashboards + Ingress │
+  └─────────────────────────────────────┘
+
+  Optional parallel path:
+  [Apps] → OTLP → Jaeger collector (LB) → trace storage / query UI
+  [Kafka namespace] Strimzi operator — streaming bus if you buffer or integrate elsewhere
+```
+
+**Interview one-liner:** *OpenTelemetry is the **wire protocol and semantic model**; **Vector** is the **aggregator** that receives OTLP, shapes documents, and **ships to OpenSearch** using the Elasticsearch-compatible bulk API.*
+
+---
+
+## 3. OpenSearch — what’s running (typical production pattern)
+
+### 3.1 Roles (what each tier does)
+
+| Tier | Purpose |
+|------|---------|
+| **master** | Cluster coordination (not for heavy indexing/query in large clusters) |
+| **data-hot** | Primary indexing + search on “hot” indices (often larger PVCs) |
+| **data-cold** | Cheaper / slower tier for older indices (ILM-style operations in ops) |
+| **client** | Coordinating-only nodes; often exposed for HTTP **:9200** from ingest tools |
+| **OpenSearch Dashboards** | Kibana-equivalent UI; usually behind **Ingress** with TLS |
+
+### 3.2 Kubernetes objects you’d mention
+
+- **StatefulSets** for each role (stable identity, ordered rollout).
+- **Headless Services** for discovery between nodes (`*-headless`).
+- **ClusterIP** for internal API traffic; **LoadBalancer** on **client** if something outside the cluster must hit REST without going through Ingress.
+- **PVCs** with OCI **Block Volume** storage class (e.g. `oci-bv`) — hot tier often **much larger** than cold.
+- **Ingress** (e.g. `nginx`) for **Dashboards** hostname.
+
+### 3.3 Setup flow (how it likely got there)
+
+1. **OCI:** OKE cluster + node pools + CSI driver for block storage.
+2. **Namespace** `opensearch` (or Helm release namespace).
+3. **Helm / operator** deploys StatefulSets with `opensearchproject/opensearch` image and role-specific configs.
+4. **Security:** TLS inside cluster, **fine-grained roles** for ingest vs admin; passwords via **Secrets** (not plaintext in ConfigMaps — fix if you see passwords in `ConfigMap` data).
+5. **Index templates / ISM** (Index State Management): retention, forcemerge, cold migration — often configured in OpenSearch or via automation.
+
+---
+
+## 4. OpenTelemetry + Vector — what’s running
+
+### 4.1 Why Vector here?
+
+**Vector** acts as an **OTLP receiver** and **router/transformer**:
+
+- **Source `opentelemetry`:** listens for OTLP **gRPC (4317)** and **HTTP (4318)** — the standard OTel ports.
+- **Transforms (`remap`):** normalize log body/attributes/resources, set **index prefix** (e.g. per environment: prod vs uat).
+- **Sinks (`elasticsearch` type):** OpenSearch speaks the **Elasticsearch HTTP API** — Vector’s `elasticsearch` sink targets `https://<opensearch-client-service>:9200` with **daily indices** (`bulk.index` pattern with `%Y-%m-%d`).
+
+### 4.2 Things used (inventory style)
+
+| Piece | Typical in your stack |
+|-------|------------------------|
+| **Workload** | `StatefulSet` `otel-vector` (HA: multiple replicas) |
+| **Image** | `timberio/vector` (e.g. distroless variant) |
+| **Service** | `LoadBalancer` exposing **4317/4318** for external collectors / networks that can’t use in-cluster DNS |
+| **TLS** | Cert/key mounted (e.g. `vector-tls-certs` **Secret**) for OTLP ingress |
+| **Config** | `ConfigMap` `vector.yaml` (Helm-managed) |
+| **Back-pressure** | Disk **buffers** on sinks, `acknowledgements`, batch sizes — critical under load |
+| **Auth to OpenSearch** | HTTP basic to OpenSearch — **should** be Secret-backed, not inline in ConfigMap |
+
+### 4.3 Data flow (logs)
+
+1. Application or collector sends **OTLP logs** to Vector.
+2. **Remap** extracts `body` → `message`, flattens `attributes` / `resources`, picks **index prefix** from `deployment.environment` (or similar resource attribute).
+3. **Sink** bulk-indexes into OpenSearch (e.g. `voicebot-logs-prod-YYYY-MM-DD` pattern).
+
+### 4.4 Data flow (traces)
+
+1. OTLP **traces** enter the same Vector source.
+2. Light **remap** (e.g. add `processed_at`).
+3. **Sink** to a trace index pattern (e.g. `otel-traces-test-YYYY-MM-DD`) — good for **OpenSearch Observability** plugins; **Jaeger** may still be used for trace UI depending on org choices.
+
+---
+
+## 5. Related namespaces (same cluster)
+
+| Namespace | Role |
+|-----------|------|
+| **vector-collector** | Another Vector deployment (often regional collectors forwarding to aggregator, or separate OTLP entry) |
+| **jaeger** | Jaeger query/collector/agents — **OTLP on collector** (port **4317** on `jaeger-collector` LB in many setups); trace UI. *Check pod health — CrashLoop on one replica is a red flag in ops.* |
+| **kafka** | **Strimzi** operator, **Kafka UI**, entity operator — event streaming next to observability pipelines |
+| **ingress-nginx** | Ingress for UIs (Dashboards, etc.) |
+| **cert-manager** | TLS certs for Ingress / sometimes internal |
+
+---
+
+## 6. OCI-specific talking points (interview)
+
+- **OKE** runs the workloads; **OCI Block Volume** backs OpenSearch data PVCs.
+- **Load Balancers** are OCI LB as a Service — health checks must match **Service** ports and **Network Security Groups** / subnet rules.
+- **OCI Search with OpenSearch** exists as a **managed** alternative; your setup is **self-managed OpenSearch on OKE** — trade-off: **full control vs operational burden** (upgrades, backups, ISM).
+- **Observability of the observability stack:** monitor Vector buffer size, OpenSearch **cluster health**, **jvm heap**, **disk watermarks**, and **ingest lag**.
+
+---
+
+## 7. Debugging mindset (platform)
+
+| Symptom | Check |
+|---------|--------|
+| No documents in OpenSearch | Vector pods, ConfigMap sinks `endpoints`, auth, **index permissions** |
+| OTLP refused | TLS mismatch, wrong LB IP, firewall, cert SAN |
+| Hot nodes disk full | ISM delete/move, shard sizing, **watermark** errors in OpenSearch logs |
+| Duplicate or missing logs | Idempotency at source; Vector **ack** settings; clock skew |
+
+**Commands:**
+
+```bash
+kubectl get pods -n otel-vector
+kubectl logs -n otel-vector sts/otel-vector --tail=100
+kubectl get svc -n opensearch
+kubectl describe pod -n jaeger -l app.kubernetes.io/component=collector
+```
+
+---
+
+## 8. Security hardening (say this in senior interviews)
+
+- Move OpenSearch credentials from **ConfigMap** to **Secret** and mount or env-inject.
+- Turn on **TLS verification** (`verify_certificate: true`) for OpenSearch client when certs are trusted internally.
+- Restrict **NetworkPolicy** so only Vector can reach OpenSearch **:9200**.
+- **Rotate** credentials if they ever appeared in YAML dumps or tickets.
+
+---
+
+## 9. One-minute “what I run” story
+
+*“We run **OpenSearch on OKE** with tiered StatefulSets and **OpenSearch Dashboards** behind Ingress. **Telemetry** hits **Vector** over **OTLP** with TLS; Vector **remaps** logs for environment-specific indices and **bulk-writes** to OpenSearch. **Jaeger** and **Kafka** sit alongside for trace UX and streaming. I care about **PVC capacity**, **Vector buffers**, and **OpenSearch cluster health** during incidents.”*
+
+---
+
+*Context used for inventory: `kubectl config use-context oke-observability`. Switch back to your EKS context when done: `kubectl config use-context <previous>`.*
