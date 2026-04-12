@@ -1,0 +1,328 @@
+# Terraform — one interview guide (concepts + AWS + commands + layout)
+
+**Use this file only** for Terraform prep. Pair with **`ANSIBLE_INTERVIEW_GUIDE.md`** (configure servers) and **`K8S_MANIFEST_SAMPLES.md`** (Kubernetes).
+
+---
+
+## 1. Terms (quick scan)
+
+| Term | Meaning |
+|------|---------|
+| **Provider** | Plugin for an API (AWS, Azure, …). |
+| **Resource** | Create/manage cloud object (`aws_instance`, `aws_s3_bucket`). |
+| **Data source** | Read-only (`data.aws_ami`, `data.aws_vpc`) — no lifecycle here. |
+| **Module** | Reusable `.tf` folder with `variables` + `outputs`. |
+| **State** | Maps addresses → real IDs (`terraform.tfstate`). |
+| **Backend** | Where state lives (local vs **S3** + **DynamoDB** lock). |
+| **Workspace** | Optional extra state files (`terraform workspace select prod`). |
+
+**Data vs resource:** **`data`** = already exists or lookup; **`resource`** = Terraform owns create/update/delete.
+
+---
+
+## 2. Concepts (say in interview)
+
+### Providers & init
+
+- `required_providers` pins versions; `terraform init` downloads plugins and configures backend.
+- Credentials via env / `~/.aws/credentials` / IAM role — not passwords in Git.
+
+### Resources
+
+- `resource "aws_instance" "web" { ... }` → reference as `aws_instance.web`.
+- Terraform compares **config + state** to **actual** cloud and **converges**.
+- Prefer **variables** over magic strings; **`lifecycle`** for create_before_destroy, etc.
+
+### State
+
+- Default local **`terraform.tfstate`** — don’t hand-edit; **sensitive** data may appear.
+- **Remote:** S3 + **DynamoDB lock** so teams don’t corrupt state.
+- **`terraform state list` / `show`** for inspection; **`import`** for brownfield.
+
+### Plan / apply / destroy
+
+- **`plan`** = preview; **`apply`** = execute; **`destroy`** = remove tracked resources.
+- **`-target`** only in emergencies (breaks dependency ordering).
+
+### Variables, tfvars, outputs
+
+- `variable "env" {}` + **`terraform.tfvars`** or **`-var-file=prod.tfvars`**.
+- **`output`** exposes IDs for humans or other stacks; `sensitive = true` redacts CLI output (not state).
+
+### Modules
+
+- `module "vpc" { source = "./modules/vpc" ... }` — pin **version**/tag for prod.
+- Root passes **`module.vpc.output_name`** into child modules.
+
+### Terraform vs Ansible
+
+| | Terraform | Ansible |
+|---|-----------|---------|
+| **Does** | Cloud **infrastructure** (VPC, EC2, RDS APIs) | **OS/apps** on machines (packages, files, systemd) |
+| **Tracks** | **State file** | Current vs desired per task |
+| **Rerun** | No-op if cloud matches | Idempotent tasks |
+
+---
+
+## 3. Minimal IAC — EC2 + S3
+
+```hcl
+terraform {
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.0"
+    }
+  }
+}
+
+provider "aws" {
+  region = var.aws_region
+}
+
+resource "aws_s3_bucket" "app" {
+  bucket = var.bucket_name
+}
+
+resource "aws_instance" "web" {
+  ami           = var.ami_id
+  instance_type = var.instance_type
+  subnet_id     = var.subnet_id
+  tags          = { Name = "web-1" }
+}
+```
+
+---
+
+## 4. S3 + bucket policy + security group + EC2
+
+```hcl
+resource "aws_security_group" "web" {
+  name        = "web-sg"
+  description = "HTTP and SSH"
+  vpc_id      = var.vpc_id
+
+  ingress {
+    description = "HTTP"
+    from_port   = 80
+    to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  ingress {
+    description = "SSH"
+    from_port   = 22
+    to_port     = 22
+    protocol    = "tcp"
+    cidr_blocks = [var.admin_cidr]
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+}
+
+resource "aws_s3_bucket" "logs" {
+  bucket = "${var.project}-logs-${var.env}"
+}
+
+resource "aws_s3_bucket_policy" "logs" {
+  bucket = aws_s3_bucket.logs.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid       = "DenyInsecureTransport"
+      Effect    = "Deny"
+      Principal = "*"
+      Action    = "s3:*"
+      Resource = [
+        aws_s3_bucket.logs.arn,
+        "${aws_s3_bucket.logs.arn}/*",
+      ]
+      Condition = { Bool = { "aws:SecureTransport" = "false" } }
+    }]
+  })
+}
+
+resource "aws_instance" "app" {
+  ami                    = var.ami_id
+  instance_type          = var.instance_type
+  subnet_id              = var.subnet_id
+  vpc_security_group_ids = [aws_security_group.web.id]
+  tags                   = { Name = "${var.project}-app" }
+}
+```
+
+---
+
+## 5. Modules — VPC → EC2
+
+**Root:**
+
+```hcl
+module "vpc" {
+  source       = "./modules/vpc"
+  cidr_block   = var.vpc_cidr
+  env          = var.env
+}
+
+module "app_server" {
+  source    = "./modules/ec2"
+  subnet_id = module.vpc.private_subnet_ids[0]
+  vpc_id    = module.vpc.vpc_id
+  env       = var.env
+}
+```
+
+**`modules/vpc/main.tf` (snippet):**
+
+```hcl
+resource "aws_vpc" "this" {
+  cidr_block           = var.cidr_block
+  enable_dns_hostnames = true
+  tags                 = { Name = "vpc-${var.env}" }
+}
+
+resource "aws_subnet" "private" {
+  vpc_id            = aws_vpc.this.id
+  cidr_block        = cidrsubnet(var.cidr_block, 4, 0)
+  availability_zone = data.aws_availability_zones.available.names[0]
+}
+
+data "aws_availability_zones" "available" { state = "available" }
+```
+
+**`modules/vpc/outputs.tf`:**
+
+```hcl
+output "vpc_id" { value = aws_vpc.this.id }
+output "private_subnet_ids" { value = [aws_subnet.private.id] }
+```
+
+---
+
+## 6. Data sources
+
+```hcl
+data "aws_ami" "al2023" {
+  most_recent = true
+  owners      = ["amazon"]
+  filter {
+    name   = "name"
+    values = ["al2023-ami-*-x86_64"]
+  }
+}
+
+data "aws_vpc" "shared" {
+  id = var.existing_vpc_id
+}
+
+resource "aws_instance" "x" {
+  ami           = data.aws_ami.al2023.id
+  subnet_id     = var.subnet_id
+  instance_type = "t3.micro"
+}
+```
+
+---
+
+## 7. Folder structure (typical org repo)
+
+```text
+terraform/
+├── main.tf
+├── main-backend.tf          # optional: only backend {} block
+├── provider.tf
+├── variables.tf
+├── outputs.tf
+├── modules/
+│   ├── vpc/                 # main.tf, variables.tf, outputs.tf
+│   ├── ec2-direct/
+│   ├── ec2-jumpbox/
+│   ├── ecs/
+│   ├── eks/                 # + node groups, IAM roles
+│   ├── elasticache/
+│   └── rds/
+└── environments/
+    ├── dev/                 # backend.tf, terraform.tfvars
+    ├── prod/
+    └── countries/
+        ├── in-prod/
+        └── us-prod/
+```
+
+**Talk track:** root **wires modules**; **dev/prod/countries** use different **S3 state keys**; **VPC outputs** feed EKS/RDS/ElastiCache; **EKS module** sets cluster + **node IAM** (worker node policies, CNI, ECR pull).
+
+**EKS variables (typical):** `cluster_version`, `subnet_ids`, `endpoint_public_access`, node `instance_types` / `desired_size`, IAM for cluster + node group.
+
+---
+
+## 8. Import (brownfield)
+
+```bash
+terraform import aws_s3_bucket.logs my-bucket-name
+terraform import aws_instance.app i-0abc123456789abcd
+terraform import aws_security_group.web sg-0abc123456789abcd
+```
+
+Write the **`resource`** block first; import only updates **state**. Run **`plan`** after to fix attribute drift.
+
+---
+
+## 9. Commands (day-to-day)
+
+| Command | Use |
+|---------|-----|
+| `terraform init` | Providers + backend |
+| `terraform init -upgrade` | Bump providers within constraints |
+| `terraform validate` | Syntax check |
+| `terraform fmt -recursive` | Format `.tf` |
+| `terraform plan` | Preview changes |
+| `terraform apply` | Apply |
+| `terraform apply -target=RES` | Emergency partial (avoid habit) |
+| `terraform destroy` | Delete tracked resources |
+| `terraform state list` / `state show` | Inspect state |
+| `terraform state rm` | Drop from state (does not delete cloud — dangerous) |
+| `terraform output` | Print outputs |
+| `terraform workspace list` | If using workspaces |
+| `terraform providers` | Locked versions |
+
+---
+
+## 10. Backend (dev vs prod isolation)
+
+```hcl
+terraform {
+  backend "s3" {
+    bucket         = "mycompany-terraform-state"
+    key            = "dev/network/terraform.tfstate"   # prod: change key only
+    region         = "us-east-1"
+    dynamodb_table = "terraform-locks"
+    encrypt        = true
+  }
+}
+```
+
+**Countries:** e.g. `key = "countries/in-prod/eks/terraform.tfstate"`.
+
+---
+
+## 11. Gotchas + checklist
+
+**Gotchas:** protect **state**; pin **provider** versions; **drift** if someone edits in console; secrets in **state** and sometimes **plan** output.
+
+**Checklist:**
+
+- [ ] Explain **resource** vs **data** vs **module**
+- [ ] **State** + **remote backend** + **lock**
+- [ ] **SG + instance + S3 policy** at high level
+- [ ] **EKS:** cluster vs node group vs **node IAM role**
+- [ ] Always **`plan`** before **`apply`**; **`import`** for existing resources
+
+---
+
+*Ansible: `ANSIBLE_INTERVIEW_GUIDE.md`. Kubernetes manifests: `K8S_MANIFEST_SAMPLES.md`.*
