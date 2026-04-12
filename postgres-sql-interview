@@ -1,0 +1,188 @@
+# PostgreSQL — HA, auto-failover, Citus (distributed / tenant sharding), DBA ops
+
+Interview and runbook-style notes: **redundancy**, **automatic failover**, **Citus** at a high level, **maintenance commands**, and **what breaks** in production.
+
+---
+
+## 1. PostgreSQL HA without Citus (baseline)
+
+### Building blocks
+
+| Piece | Role |
+|-------|------|
+| **Streaming replication** | Primary sends WAL to one or more **standbys** (async or sync replicas). |
+| **Synchronous replica** | Stronger durability (commit waits for standby) — **higher latency**; risk if sync standby is down (depends on `synchronous_standby_names` / quorum settings). |
+| **Quorum / multiple async** | Common cloud pattern: **one** sync or **quorum commit** among several standbys (PostgreSQL 10+ features evolved — check version). |
+
+**Redundancy:** at least **two** independent nodes (different AZs), **WAL** shipping, **monitoring** replication lag (`pg_stat_replication` on primary, `pg_stat_wal_receiver` on standby).
+
+### Auto-failover (who promotes the standby?)
+
+PostgreSQL **core** does not promote a standby by itself. You add:
+
+| Tool / pattern | Idea |
+|----------------|------|
+| **Patroni** | Stores leader key in **DCS** (etcd, Consul, ZooKeeper); **patronictl**, **callbacks**; very common self-managed HA. |
+| **pg_auto_failover** | Postgres extension + monitor; simpler topology, good for smaller setups. |
+| **Repmgr** | Replication manager + **witness**; promotion/follow. |
+| **Cloud managed** | **RDS Multi-AZ**, **Aurora**, **Cloud SQL**, **Azure Flexible** — failover is **vendor**; you tune **timeouts** and **DNS/endpoint** behavior. |
+| **K8s** | **CloudNativePG**, **Zalando**, **StackGres** — operator owns **failover** + PVCs. |
+
+**Interview line:** *“HA is **replication + fencing + orchestration**. Failover is either **Patroni/etcd** (self-managed) or **the cloud control plane** (managed).”*
+
+---
+
+## 2. Citus — what it adds (distributed PostgreSQL)
+
+### Architecture
+
+- **Coordinator** — receives queries; **plans** distributed SQL; talks to **workers**.
+- **Worker nodes** — store **shards** (horizontal partitions of **distributed** tables).
+- **Metadata** on coordinator — shard placement, **reference tables**, **distributed** DDL.
+
+Data is usually sharded by a **distribution column** (e.g. `tenant_id`, `user_id`) on **distributed** tables (`create_distributed_table`). **Colocation** keeps related rows on the same worker for **fast joins**.
+
+### “Schema-based sharding” vs Citus-native sharding
+
+| Approach | Meaning |
+|----------|---------|
+| **Citus row / hash sharding** | **Standard Citus:** `create_distributed_table('events', 'tenant_id', colocate_with => '...')` — physical shards by **hash(range)** of key. |
+| **Schema-based multi-tenancy (application)** | **One schema per tenant** on **one** DB — **no** horizontal scale per tenant by default; scale-out needs **routing** (tenant → DB/cluster) or **Citus** with care. |
+| **Citus “schema” / tenant isolation (product evolution)** | Citus (especially **Citus 11+** and **Azure Cosmos DB for PostgreSQL** lineage) documents patterns for **tenant** workloads: often still **distributed tables** with **tenant_id**, sometimes **schema + coordinator** patterns — **always read current Citus docs** for “schema-based” / **tenant** features in **your** version. |
+
+**DBA takeaway:** confirm whether the team means **hash-distributed tables** (typical Citus) or **many schemas** on a single coordinator (scale limits: **connections**, **metadata**, **vacuum** per schema). For **true** shard scale-out, **distribution keys** and **colocation** design matter more than “schema name” alone.
+
+### HA inside a Citus cluster
+
+- **Workers** and **coordinator** are each **PostgreSQL** servers — each tier should have **replication + failover** (Patroni per node, or managed disks + HA **per role**).
+- **Coordinator failure:** clients fail until **VIP/DNS** points to new coordinator or **read-only** routing is defined — **design coordinator HA** explicitly (Patroni, cloud HA endpoint, or Citus-managed product behavior).
+- **Shard rebalancing:** **Citus rebalancer** moves shards between workers — **planned maintenance**, watch **disk** and **locks**.
+
+---
+
+## 3. Commands — replication & health (non-Citus and general)
+
+```sql
+-- Primary: who is replicating, how far behind?
+SELECT application_name, client_addr, state, sync_state,
+       pg_wal_lsn_diff(pg_current_wal_lsn(), sent_lsn) AS sent_lag_bytes,
+       pg_wal_lsn_diff(sent_lsn, write_lsn) AS write_lag_bytes,
+       pg_wal_lsn_diff(write_lsn, flush_lsn) AS flush_lag_bytes,
+       pg_wal_lsn_diff(flush_lsn, replay_lsn) AS replay_lag_bytes
+FROM pg_stat_replication;
+
+-- Standby: am I receiving WAL?
+SELECT status, conninfo, received_lsn, latest_end_lsn
+FROM pg_stat_wal_receiver;
+
+-- Role
+SELECT pg_is_in_recovery();  -- true = standby
+```
+
+```bash
+# Patroni (example)
+patronictl -c /etc/patroni.yml list
+patronictl -c /etc/patroni.yml show-config
+```
+
+---
+
+## 4. Commands — Citus maintenance & inspection
+
+> Names may vary slightly by **Citus version**; use `\df citus*` in `psql` on the **coordinator**.
+
+```sql
+-- Extension
+CREATE EXTENSION IF NOT EXISTS citus;
+
+-- Cluster overview
+SELECT * FROM citus_get_active_worker_nodes();
+SELECT * FROM citus_tables WHERE citus_table_type = 'distributed';
+
+-- Shard placement
+SELECT * FROM citus_shards;
+SELECT logicalrelid, shardid, shardlength, nodename, nodeport
+FROM citus_shard_placement()
+ORDER BY logicalrelid, shardid;
+
+-- Move / rebalance (planned window; can be heavy)
+SELECT citus_rebalance_start();
+-- or monitor progress per docs: citus_rebalance_status(), etc.
+
+-- Distributed deadlock / long transactions (coordinator)
+SELECT * FROM citus_dist_stat_activity;  -- if available in your version
+
+-- Connections per node (run on coordinator + workers as needed)
+SELECT count(*), state FROM pg_stat_activity GROUP BY state;
+SELECT pid, usename, application_name, client_addr, state, wait_event, query
+FROM pg_stat_activity
+WHERE state <> 'idle'
+ORDER BY query_start;
+```
+
+```sql
+-- Routine PostgreSQL (all nodes: coordinator + workers)
+VACUUM (VERBOSE, ANALYZE) schema_name.table_name;
+-- Autovacuum tuning: autovacuum_* settings per table if bloat
+
+SELECT relname, n_live_tup, n_dead_tup, last_vacuum, last_autovacuum
+FROM pg_stat_user_tables
+WHERE schemaname NOT IN ('pg_catalog','information_schema')
+ORDER BY n_dead_tup DESC
+LIMIT 20;
+```
+
+---
+
+## 5. Commands — backups & PITR (conceptual)
+
+- **Physical base backup** + **WAL archiving** (`archive_command`) → **PITR** restore on any node — **test restores** quarterly.
+- **Citus:** backup **each node** (coordinator + workers) in a **consistent** way for **disaster**; **logical** dumps (`pg_dump`) per DB for **smaller** datasets or **migration** — not a substitute for **cluster-wide** DR without a coordinated procedure.
+- Managed offerings often expose **automated backups** — still verify **RPO/RTO**.
+
+---
+
+## 6. DBA issues — PostgreSQL HA
+
+| Issue | What goes wrong | What to check |
+|-------|-----------------|---------------|
+| **Replication lag** | Standby too slow; **failover** loses recent data if async. | `pg_stat_replication`, disk IO, `max_wal_size`, network. |
+| **Split-brain** (self-managed) | Two primaries — **data corruption**. | **Patroni fencing**, **STONITH**, **quorum** in DCS; never **manual promote** without understanding. |
+| **Failover flapping** | Network blip toggles leader. | **TTL**, **health checks**, **synchronous_commit** policy. |
+| **Connection storms** | Apps don’t use **pooler** or **retry** on failover. | **PgBouncer** / pool mode, app **timeouts**, **JDBC** targetServerType. |
+| **Disk full on primary** | WAL can’t write — **outage**. | Alerts on **volume %**, **WAL** retention, **archiving**. |
+
+---
+
+## 7. DBA issues — Citus-specific
+
+| Issue | What goes wrong | What to check |
+|-------|-----------------|---------------|
+| **Bad distribution key** | **Skew** — one worker hot, others idle. | Shard counts, **rebalancer**, query plans (`EXPLAIN`). |
+| **Cross-shard joins** | Slow without **colocation** or **reference tables**. | `create_reference_table`, **colocate_with**, redesign. |
+| **Distributed deadlocks** | Different order of locks across workers. | App transaction design; `citus_dist_stat_activity` (if available). |
+| **DDL / metadata** | **Distributed** DDL blocks or fails mid-way. | Citus version, **MX** / **metadata** sync — follow upgrade notes. |
+| **Rebalance** | Long locks, IO spike. | **Maintenance window**, **drain** traffic, monitor **progress**. |
+| **Vacuum / bloat** | Per-node **autovacuum** must keep up on **every** worker. | **Per-node** stats; **large** tenants on one shard hurt. |
+| **Coordinator SPOF** | If coordinator is single — **whole cluster** down for writes. | **HA design** for coordinator (product-specific). |
+
+---
+
+## 8. Checklist — before you promise HA + Citus in an interview
+
+- [ ] **RPO/RTO** for failover (async vs sync).
+- [ ] **Who** runs failover (Patroni vs cloud vs operator).
+- [ ] **Citus** topology: N workers, **replication factor**, **coordinator** HA.
+- [ ] **Sharding key** chosen with **product** — not only DBA.
+- [ ] **Backups** per node + **restore drill**.
+- [ ] **Monitoring:** replication lag, **disk**, **connections**, **Citus** rebalancer, **vacuum** age.
+
+---
+
+## References
+
+- PostgreSQL replication: [https://www.postgresql.org/docs/current/high-availability.html](https://www.postgresql.org/docs/current/high-availability.html)
+- Patroni: [https://patroni.readthedocs.io/](https://patroni.readthedocs.io/)
+- Citus: [https://docs.citusdata.com/](https://docs.citusdata.com/) (distributed tables, **multi-tenant** modeling, operations)
+
+*File: `POSTGRESQL_CITUS_HA_DBA.md` — align commands with your **PostgreSQL** and **Citus** versions.*
