@@ -1,0 +1,145 @@
+# Strimzi + Karpenter — platform engineer interview notes
+
+Practical framing: **what it is**, **how you install**, **how you prove it works**, **tradeoffs**, and **how you’d roll it out**.
+
+---
+
+## Part A — Strimzi (Kafka on Kubernetes)
+
+### What Strimzi is
+
+- **Strimzi** is a **Kubernetes operator** that manages **Apache Kafka** (and often **Kafka Connect**, **MirrorMaker**, **Bridge**) using **Custom Resources** (CRDs).
+- You declare **`Kafka`** (cluster topology, storage, listeners, metrics), **`KafkaTopic`**, **`KafkaUser`**, etc.; the operator reconciles desired state.
+- **Platform angle:** you own **CRDs**, **RBAC**, **storage classes**, **upgrades**, **backup/disaster recovery**, and **integration** with monitoring — not application message schemas.
+
+### Core concepts (talk track)
+
+| Concept | Interview line |
+|--------|----------------|
+| **Operator pattern** | Control loop watches CRs → creates StatefulSets, Services, ConfigMaps, PVCs. |
+| **KRaft vs ZooKeeper** | Modern Kafka can run **without ZooKeeper** (KRaft). Strimzi supports both; **new clusters** often target **KRaft** to drop ZK ops. |
+| **Listeners** | `plain`, `tls`, `route` / Ingress / **NodePort** depending on exposure; **TLS** and **ACLs** for production. |
+| **Storage** | Kafka is **I/O heavy** — use **fast disks** (e.g. gp3/io2 on AWS), right **size**, **retention** tuned; **do not** share one tiny PVC for everything without sizing. |
+| **High availability** | **Rack awareness** (spread brokers across AZs), **replication factor** ≥ 3 for production topics, **min.in.sync.replicas**. |
+
+### Install outline (generic)
+
+1. **Namespace** dedicated (e.g. `kafka` or `strimzi-system` for operator-only layouts — follow current Strimzi docs for recommended layout).
+2. **Install CRDs + operator** — usually **Helm** or **YAML release** from Strimzi; version-pin for prod.
+3. **RBAC** — ClusterRole for operator; least privilege where possible.
+4. **Deploy `Kafka` CR** — replicas, storage, resources, listeners, **Kafka version** image.
+5. **Optional:** **`KafkaTopic` / `KafkaUser`**, Connect clusters, metrics **ServiceMonitor** if Prometheus stack exists.
+
+Example **verification** commands (adjust namespace and CR names):
+
+```bash
+kubectl get crd | grep kafka.strimzi.io
+kubectl -n kafka get kafka
+kubectl -n kafka get pods -l strimzi.io/cluster=my-cluster
+kubectl -n kafka describe kafka my-cluster
+```
+
+**Working** means: operator **Ready**, brokers **Running**, PVCs **Bound**, and you can **produce/consume** (in-cluster client or port-forward to a test topic).
+
+### Platform pitfalls (mention in interview)
+
+- **Rolling upgrades:** Strimzi supports Kafka version bumps in a controlled way — plan **maintenance windows** and read **release notes** (protocol / inter-broker compatibility).
+- **Storage expansion** depends on CSI / cloud — not always online resize everywhere.
+- **Multi-tenant Kafka** on one cluster: **quotas**, **ACLs**, **separate listeners** or careful **topic naming** — often a **shared services** team owns this.
+
+---
+
+## Part B — Karpenter (node autoscaling)
+
+### What Karpenter is
+
+- **Karpenter** is a **node provisioning** controller: it watches **unschedulable pods** and **creates/removes nodes** (on AWS: EC2 instances) to fit workload shape — fast **bin-packing**, **consolidation**, and **right-sized** instance types.
+- It is **not** a replacement for **Cluster Autoscaler (CA)** in the sense of “pick one for everything” — on many AWS EKS setups you run **Karpenter instead of CA** for worker scaling, or use **one** node-autoscaling solution to avoid fighting.
+
+### Karpenter vs Cluster Autoscaler — tradeoffs
+
+| Topic | **Cluster Autoscaler (CA)** | **Karpenter** |
+|-------|----------------------------|---------------|
+| **Model** | Scales **existing Auto Scaling Groups** (add/remove nodes in fixed **instance-type pools**). | **Directly provisions** instances per **NodePool** constraints (AWS: **EC2NodeClass** + **NodePool** in v1 API). |
+| **Speed** | Waits for ASG cooldowns; **slower** scale-out when pools are wrong-sized. | Often **faster** to place pending pods — creates nodes that **match pod requests** (CPU/mem/gpu/arch). |
+| **Flexibility** | Limited to **predefined** ASG instance types / sizes. | **Broader** instance diversification under constraints — better **utilization** if policies allow. |
+| **Cost / ops** | Predictable if ASGs are simple; **underutilized** nodes if pools are coarse. | **Consolidation** can **evict** and **replace** nodes to save cost — **more aggressive**; needs **PodDisruptionBudgets** and app tolerance to rescheduling. |
+| **Complexity** | Fewer moving parts if you already live in ASG-only world. | **IAM**, **Subnet / SG** wiring, **NodePool** YAML, **interruption** handling (spot) — steeper **initial** platform design. |
+| **Multi-AZ** | ASG per AZ pattern is well understood. | Must design **NodePools** + **topology** so spread and **capacity** stay balanced. |
+
+**One-liner for interviews:** *“CA scales **fixed node groups**; Karpenter **provisions nodes from constraints** — faster and more flexible, but you must design for **consolidation**, **interruptions**, and **IAM** correctly.”*
+
+### Install outline (AWS EKS — typical)
+
+> Exact API names shifted in **Karpenter v1** (`NodePool`, `EC2NodeClass`). Align commands with the **version** you deploy.
+
+1. **IAM** — Karpenter needs permissions to **create instances**, **pass InstanceProfile**, **describe** EC2/Subnets/SGs, **tag**, and integrate with **EKS** (use official **Terraform** or **Helm + IRSA** docs for your version).
+2. **Subnet / SG** — **tags** on subnets (discovery), **security groups** that allow **node ↔ control plane** and **workload** traffic.
+3. **Helm install** — `karpenter` chart into `karpenter` namespace; **service account** with **IRSA**.
+4. **Define `EC2NodeClass` + `NodePool`** (v1) — instance families, **limits**, **taints**, **startup taints**, **consolidation** policy.
+5. **(Optional)** **Interruption queue** — SQS + **interruption handling** for spot / rebalance (version-specific).
+
+### How to check it is working
+
+1. **Pods pending** — deploy a Deployment that **requests** more CPU/mem than current nodes can satisfy (or use a **toleration** only a new NodePool satisfies).
+2. **Watch** — `kubectl get nodes -w` and Karpenter logs:
+   ```bash
+   kubectl -n karpenter logs -l app.kubernetes.io/name=karpenter -f
+   ```
+3. **Expect** — new **Node** appears, pod **Scheduled**, Karpenter events show **provisioning** / **launched**.
+4. **Scale down** — delete workload or let **consolidation** run (if enabled); nodes **drain** / **terminate** per policy (respect **PDBs**).
+
+```bash
+kubectl get nodepools          # or NodePool depending on API version
+kubectl get ec2nodeclasses     # or EC2NodeClass
+kubectl describe nodepool <name>
+```
+
+### Platform pitfalls
+
+- **Bin-packing vs PDB:** aggressive consolidation **evicts** pods — apps need **graceful shutdown** and **PDBs**.
+- **Spot + databases:** usually a **bad default** unless you know **interruption** handling.
+- **Single controller:** do **not** run **CA and Karpenter** both trying to own the same **worker** capacity without a **clear** split (e.g. separate node groups) — causes **thrash**.
+
+---
+
+## Part C — Implementation plan (how you’d propose it)
+
+### Phase 0 — Discovery
+
+- **EKS version**, **OIDC/IRSA** readiness, **subnet tags**, **existing CA/ASG** layout.
+- **Workload** profiles: batch vs stateful, **GPU**, **Windows**, **compliance** (dedicated tenancy).
+- For **Strimzi:** **RPO/RTO**, **throughput**, **retention**, **multi-region** (MirrorMaker / MSK comparison if enterprise prefers managed).
+
+### Phase 1 — Non-prod
+
+- Deploy **Karpenter** in **dev** with **small** NodePool limits; run **load tests** (pending pods, scale-up time).
+- Deploy **Strimzi** with **minimal** Kafka cluster; validate **operators**, **upgrades** on a **clone** procedure.
+
+### Phase 2 — Hardening
+
+- **IaC** (Terraform) for **IAM**, **Helm values**, **NodePools**, **Kafka CRs** (Git-reviewed).
+- **Alerts:** Karpenter **errors**, **unschedulable** backlog; Kafka **under-replicated partitions**, **disk**, **controller lag**.
+- **Runbooks:** upgrade, **node failure**, **PVC full**, **Karpenter** consolidation disabled for incident windows.
+
+### Phase 3 — Prod rollout
+
+- **Change window** for **Strimzi** Kafka upgrades; **canary** workloads on **Karpenter** pools before **default** scheduling.
+- **Cost review** after 2–4 weeks (consolidation, instance mix).
+
+---
+
+## Quick interview sound bites
+
+- **Strimzi:** *“Operator-managed Kafka with CRDs; I care about **storage**, **listeners**, **upgrades**, and **runbooks** — apps care about **topics** and **schemas**.”*
+- **Karpenter vs CA:** *“CA resizes **ASGs**; Karpenter **provisions** nodes to match **pending pods** — better **fit** and **speed**, trade-off is **policy** and **consolidation** safety.”*
+- **Proof:** *“Pending pod → **watch nodes** and **Karpenter logs** → **node** comes up → pod **Scheduled**.”*
+
+---
+
+## References (read upstream before implementing)
+
+- Strimzi: [https://strimzi.io/documentation/](https://strimzi.io/documentation/)
+- Karpenter (AWS): [https://karpenter.sh/](https://karpenter.sh/) — install docs match **chart version** you run.
+
+*File: `STRIMZI_KARPENTER_PLATFORM_INTERVIEW.md` (Implementation workspace).*
