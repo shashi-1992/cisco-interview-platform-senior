@@ -1,0 +1,257 @@
+# Helm (microservices) + Istio — interview notes
+
+Use with **`K8S_PLATFORM_ENGINEERING_GUIDE.md`** (Istio section) and **`K8S_MANIFEST_SAMPLES.md`**.
+
+---
+
+## 1. Helm in one minute
+
+**Helm** packages Kubernetes YAML into a **Chart**: versioned, parameterized (`values.yaml`), installable with `helm install` / `helm upgrade`.
+
+| Piece | Role |
+|-------|------|
+| **`Chart.yaml`** | Chart name, version, appVersion, dependencies (optional). |
+| **`values.yaml`** | Default config — image tag, replicas, env, resources, **per-env overrides**. |
+| **`templates/`** | Go templates (`{{ .Values.replicaCount }}`) → rendered manifests. |
+| **`templates/_helpers.tpl`** | Reusable template snippets (labels, names). |
+| **`charts/`** | Subcharts (dependencies unpacked here when using umbrella chart). |
+
+**Why teams use it:** same chart for **dev/stage/prod** by swapping **`values.dev.yaml`** / **`values.prod.yaml`**; CI runs `helm upgrade --install` with `-f values.$ENV.yaml`.
+
+---
+
+## 2. Microservices — common folder structures
+
+### Option A — **One chart per service** (most common at scale)
+
+Each repo (or mono-repo folder) owns **one** deployable unit.
+
+```text
+services/
+├── order-service/
+│   └── chart/
+│       ├── Chart.yaml
+│       ├── values.yaml
+│       ├── values.dev.yaml
+│       ├── values.prod.yaml
+│       └── templates/
+│           ├── deployment.yaml
+│           ├── service.yaml
+│           ├── hpa.yaml
+│           ├── serviceaccount.yaml
+│           └── _helpers.tpl
+├── payment-service/
+│   └── chart/
+│       └── ...
+└── api-gateway/
+    └── chart/
+        └── ...
+```
+
+**Interview line:** *“Each microservice has its own Helm chart and lifecycle; teams release independently.”*
+
+---
+
+### Option B — **Mono-repo with `charts/` at root**
+
+```text
+my-platform/
+├── charts/
+│   ├── order/
+│   ├── payment/
+│   └── gateway/
+├── environments/
+│   ├── dev/
+│   │   └── order-values.yaml    # overrides only what differs
+│   └── prod/
+│       └── order-values.yaml
+└── README.md
+```
+
+Deploy: `helm upgrade --install order ./charts/order -n orders -f environments/prod/order-values.yaml`
+
+---
+
+### Option C — **Umbrella chart** (meta-chart that bundles subcharts)
+
+```text
+platform/
+├── Chart.yaml          # dependencies: order, payment (tgz or repo URL)
+├── values.yaml         # global + per-subchart: order: {...}, payment: {...}
+└── charts/             # populated by `helm dependency update`
+```
+
+**`Chart.yaml` snippet:**
+
+```yaml
+apiVersion: v2
+name: platform
+version: 1.0.0
+dependencies:
+  - name: order
+    version: "1.x"
+    repository: "file://../charts/order"
+  - name: payment
+    version: "1.x"
+    repository: "file://../charts/payment"
+```
+
+**When to say umbrella:** *“We use it for a **single** `helm install` of the whole product in demo/staging; prod often still deploys **per-service** charts for independent releases.”*
+
+---
+
+### Option D — **GitOps (Argo CD / Flux)**
+
+- Helm chart lives in Git; **Argo CD Application** points to path + value file.
+- **Folder structure** same as A/B; extra **`Application.yaml`** (Argo) per env.
+
+---
+
+## 3. Minimal chart files (what interviewers expect you to name)
+
+```text
+my-service/
+├── Chart.yaml
+├── values.yaml
+└── templates/
+    ├── deployment.yaml
+    ├── service.yaml
+    └── _helpers.tpl
+```
+
+**`deployment.yaml` (idea):**
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "my-service.fullname" . }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  template:
+    spec:
+      containers:
+        - name: app
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+```
+
+---
+
+## 4. Istio — how it fits **Helm + microservices**
+
+### 4.1 Plain Kubernetes (no mesh)
+
+- **Ingress** (nginx/ALB) → **Service** → **Pod**.
+- TLS often terminates at **Ingress** or **cloud LB**.
+
+### 4.2 With **Istio**
+
+- Each Pod gets an **Envoy sidecar** (or **ambient** ztunnel — know the term if your org uses it).
+- **istiod** (control plane) pushes config to Envoys.
+- Traffic **service-to-service** can be **mTLS**, **retries**, **timeouts**, **canary** weights.
+
+**Helm side:** your **same** `Deployment`/`Service` charts stay; **Istio CRDs** are extra YAML (often a **separate** chart or `templates/virtualservice.yaml` in a “mesh” overlay).
+
+---
+
+## 5. Istio objects — match these to interview questions
+
+| Object | What it does |
+|--------|----------------|
+| **Gateway** | Entry point into mesh (replaces Ingress for mesh traffic); binds to host/port. |
+| **VirtualService** | Routing: match host/path, **split traffic** by weight (canary), retries, timeouts. |
+| **DestinationRule** | Subsets (v1/v2), **TLS** mode to upstream, **outlier detection**, circuit breaking. |
+| **PeerAuthentication** | **mTLS** mode: STRICT / PERMISSIVE / DISABLE per namespace or workload. |
+| **AuthorizationPolicy** | Allow/deny by **JWT**, principal, namespace — L7 policy. |
+| **ServiceEntry** | Register **external** services (e.g. payment API outside cluster) into mesh. |
+
+**One diagram in words:** *Client → **Gateway** → **VirtualService** routes to Service subset → **DestinationRule** says how to talk TLS and which pods are “v2”.*
+
+---
+
+## 6. Example — Istio **VirtualService** + **DestinationRule** (canary)
+
+```yaml
+apiVersion: networking.istio.io/v1beta1
+kind: VirtualService
+metadata:
+  name: order
+spec:
+  hosts:
+    - order
+  http:
+    - route:
+        - destination:
+            host: order
+            subset: stable
+          weight: 90
+        - destination:
+            host: order
+            subset: canary
+          weight: 10
+---
+apiVersion: networking.istio.io/v1beta1
+kind: DestinationRule
+metadata:
+  name: order
+spec:
+  host: order
+  subsets:
+    - name: stable
+      labels:
+        version: v1
+    - name: canary
+      labels:
+        version: v2
+```
+
+**Helm:** `subset` labels come from your **Deployment** `podLabels` in **`values.yaml`** (`version: {{ .Values.canary.version }}`).
+
+---
+
+## 7. Where Helm charts live vs Istio config
+
+| Layer | Usually stored |
+|-------|----------------|
+| **App** (Deployment, Service, HPA) | **Service Helm chart** `templates/` |
+| **Mesh** (VirtualService, DestinationRule, PeerAuth) | Separate **“istio-routing”** chart, **GitOps repo**, or **same** repo under `istio/` or `mesh/` |
+
+**Reason to split:** app team owns **image/replicas**; platform team owns **mesh policy** — different review process.
+
+---
+
+## 8. Sound bites for the interview
+
+- **Helm:** *“We package each microservice as a chart; **values** per environment; CI runs **helm upgrade --install**.”*
+- **Microservices layout:** *“**Chart per service** in the mono-repo under `charts/<name>`; prod uses **separate value files** or Argo **Application** per cluster.”*
+- **Istio:** *“**Sidecar** Envoy enforces policy; **VirtualService** does routing and canary **weights**; **DestinationRule** defines subsets and **mTLS** settings; **PeerAuthentication** sets **STRICT** mesh TLS.”*
+- **No Istio:** *“We use **Ingress + Service** only; Istio adds **mTLS** and **fine-grained traffic** at the cost of sidecar **CPU/memory**.”*
+
+---
+
+## 9. Commands (Helm day-to-day)
+
+```bash
+helm lint ./charts/order
+helm template order ./charts/order -f values.prod.yaml   # render locally, no cluster
+helm install order ./charts/order -n orders -f values.prod.yaml
+helm upgrade --install order ./charts/order -n orders -f values.prod.yaml
+helm list -n orders
+helm history order -n orders
+helm rollback order 3 -n orders
+helm dependency update ./platform   # umbrella chart
+```
+
+---
+
+## 10. Quick checklist
+
+- [ ] **Chart.yaml** vs **values.yaml** vs **templates/**.
+- [ ] **One chart per service** vs **umbrella** trade-off.
+- [ ] **Gateway + VirtualService + DestinationRule** names.
+- [ ] **mTLS STRICT** vs **PERMISSIVE** for migrations.
+- [ ] Istio config often **separate** from app chart ownership.
+
+---
+
+*AWS ALB + Ingress: `K8S_MANIFEST_SAMPLES.md` § Ingress. Deep networking: `K8S_PLATFORM_ENGINEERING_GUIDE.md` § Istio.*
