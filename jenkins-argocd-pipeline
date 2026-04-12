@@ -1,0 +1,307 @@
+# CQA pipeline — multibranch Jenkins, Helm, `exotel_configs` → `exotel_deployments` → ArgoCD
+
+How the pieces connect from **code commit** to **production manifests** in Git and **ArgoCD** sync to the cluster.
+
+---
+
+## Where this doc lives vs where repos live
+
+| What | Path / meaning |
+|------|----------------|
+| **This markdown file** | Under your **Implementation** workspace clone — e.g. `Implementation/CQA_JENKINS_ARGOCD_PIPELINE.md`. It is **not** tied to `$HOME`. |
+| **Scripts copied in Implementation** | e.g. `Implementation/CQA/scripts/pull-render-and-compare.sh` — run from that folder; set `EXOTEL_CONFIGS` / `EXOTEL_DEPLOYMENTS` to **your** clones (any directory). |
+| **Bitbucket repos (names only)** | `exotel_configs`, `exotel_deployments`, `jenkins-pipeline`, CQA app repo (vegaops / `cqa-source` in blueprint). Clone them **wherever you want** — `~/exotel_configs`, `/opt/repos/exotel_configs`, etc. Docs must **not** assume they live under your user home. |
+| **Real CQA Jenkins behavior** | Described in **`Implementation/CQA/CQA-Deployment-Blueprint.md`** (shared library `jenkins-pipeline`, `Jenkinsfile.cqa`, `DefaultJavaPipeline`, PU vs **next**). |
+
+Production CQA is **not** a self-contained Declarative `pipeline { }` in the app repo — logic lives in the **`jenkins-pipeline`** shared library; see **§5** and the blueprint.
+
+---
+
+## 1. Big picture (one diagram)
+
+```text
+  [Developer]
+       │
+       ├─► Service repo (app code) ──► build image ──► ECR tag
+       │
+       └─► exotel_configs (Helm chart + values per env)
+                 │
+                 ▼
+       ┌──────────────────────────────────────┐
+       │  Jenkins (multibranch)               │
+       │  • checks out exotel_configs         │
+       │  • checks out exotel_deployments     │
+       │  • pulls env / branch (master, next) │
+       │  • helm template cqa/k8s             │
+       │    + values.integration.yaml         │
+       │    + values.qa.yaml  (next)          │
+       │    + values.mum1.yaml / prod.yaml    │
+       │  • writes rendered YAML to           │
+       │    exotel_deployments/cqa/{env}/     │
+       │  • git commit + push                 │
+       └──────────────────────────────────────┘
+                 │
+                 ▼
+       ┌──────────────────────────────────────┐
+       │  exotel_deployments (Git)            │
+       │  cqa/integration/                    │
+       │  cqa/qa/          (often from next)  │
+       │  cqa/mum1/      (prod-like)        │
+       │  cqa/prod/                           │
+       └──────────────────────────────────────┘
+                 │
+                 ▼
+       ┌──────────────────────────────────────┐
+       │  Argo CD                             │
+       │  Application → path = cqa/qa (etc.)    │
+       │  sync policy → cluster               │
+       └──────────────────────────────────────┘
+                 │
+                 ▼
+            [ Kubernetes cluster ]
+```
+
+**Interview line:** *“**Desired state** lives in `exotel_configs` as Helm; CI **renders** flat manifests into `exotel_deployments`; **ArgoCD** is the delivery loop from that repo to the cluster.”*
+
+---
+
+## 2. What each repo is for
+
+| Repo | Role |
+|------|------|
+| **Service / app repo** | Application source; CI builds **Docker image**, pushes **tag** to ECR. |
+| **`exotel_configs`** | **Helm chart** under `cqa/k8s/`, **values** under `cqa/k8s/values/` (`values.integration.yaml`, `values.qa.yaml`, `values.mum1.yaml`, `values.prod.yaml`). **Source of truth for intent.** |
+| **`exotel_deployments`** | **Rendered** Kubernetes YAML (what ArgoCD applies). Usually **one folder per env**: `cqa/integration`, `cqa/qa`, `cqa/mum1`, `cqa/prod`. |
+| **Argo CD** | Watches **`exotel_deployments`** (path per Application). **No Helm** in cluster — plain manifests. |
+
+---
+
+## 3. Branch story (typical Exotel-style names)
+
+| Branch / flow | Often used for |
+|---------------|----------------|
+| **`next`** | Promotion path: after **`input`**, pipeline renders **qa**, then **mum1**, **prod** (see blueprint §5.5) and pushes under `cqa/qa`, `cqa/mum1`, `cqa/prod`. |
+| **`master`** | Branch used for **exotel_deployments** checkouts and **git tag/push** (see blueprint **`DEPLOYMENT_BRANCH`**); not the multibranch trigger for CQA app code. |
+| **`pu`** | **Integration** path in CQA: build image (if needed), **`helm template`** for **integration**, commit **`cqa/integration/`**, create **PU git tag** on deployments repo. |
+
+Exact mapping for this product: **`CQA-Deployment-Blueprint.md`** (not a generic `when { branch 'master' }` toy).
+
+---
+
+## 4. What “Helm generation” does (no magic)
+
+On the agent (or Jenkins worker):
+
+```bash
+cd exotel_configs/cqa/k8s
+helm template cqa . \
+  -f values/values.qa.yaml \
+  --set image.tag="${IMAGE_TAG}" \
+  > /tmp/rendered.yaml
+```
+
+Then CI **splits** or **writes** into `exotel_deployments/cqa/qa/` (layout your org defines — sometimes one `rendered.yaml`, sometimes split resources).
+
+Local **compare** script in **this workspace**: `Implementation/CQA/scripts/pull-render-and-compare.sh` — same **helm template** idea for integration, qa, mum1, prod. Override paths:
+
+`EXOTEL_CONFIGS=/path/to/exotel_configs EXOTEL_DEPLOYMENTS=/path/to/exotel_deployments ./pull-render-and-compare.sh`
+
+---
+
+## 5. Real CQA pipeline — initiation, class order, `pu` vs `next`
+
+**Source of truth (full detail, stage-by-stage):** **`Implementation/CQA/CQA-Deployment-Blueprint.md`** in this workspace.  
+The **jenkins-pipeline** library lives in Bitbucket (`Exotel/jenkins-pipeline`); clone it anywhere — the blueprint mentions a local clone only as an optional convenience.
+
+### 5.1 How the job **starts** (initiation)
+
+1. Jenkins **Multibranch Pipeline** job is wired to the **CQA app repo** on **vegaops** (see `Constants.CQA_VEGAOPS_URL` in blueprint §5 — URL listed there).
+2. On push / branch indexing, Jenkins checks out the branch (`pu` or `next`) and loads **`Jenkinsfile.cqa`** from that branch.
+3. First lines load the **shared library**: `@Library('jenkins-pipeline@feature/pipeline-v4-cqa3')` (branch tag as your org pins it).
+4. The Jenkinsfile calls **`workflow.runDefaultJavaPipeline(params)`** — a **global variable** provided by the library (`vars/` pattern in Jenkins shared libraries).
+5. That delegates to:
+   ```text
+   workflow.runDefaultJavaPipeline(params)
+     → io.estrado.Pipeline.groovy : runDefaultJavaPipeline(args)
+     → io.estrado.pipelines.DefaultJavaPipeline.groovy : Run(args)   // main orchestrator
+   ```
+6. **`DefaultJavaPipeline.Run(args)`** runs the rest: clones, branch switch (`pu` vs `next`), `stage(...)` calls, `container('helm') { ... }`, etc.
+
+CQA does **not** use the old **`JenkinsPipelineBuilder`** path — only **`DefaultJavaPipeline`**.
+
+### 5.2 Library layout (which files matter)
+
+From blueprint §2 — under **`jenkins-pipeline`** repo `src/`:
+
+| Path | Role |
+|------|------|
+| **`io/estrado/Pipeline.groovy`** | Exposes **`runDefaultJavaPipeline`** → hands off to **`DefaultJavaPipeline`**. |
+| **`io/estrado/pipelines/DefaultJavaPipeline.groovy`** | **Main orchestrator**: branch split, order of stages, podTemplate, `input` for **next**. |
+| **`com/exotel/CommonWorkflowSteps.groovy`** | **cloneCodeRepos**, **cloneExotelDeploymentsRepo**, **computeGitCommits**, **buildJars**, **lintDockerfile**, **run** (wrapper for step sequences). |
+| **`com/exotel/JenkinsPipelineSteps.groovy`** | **copyConfigs**, **searchGitTag**, **getImageVersionFromGitTag**, **commitDeploymentFilesForTheStage** (git add/commit/tag/push to **exotel_deployments**). |
+| **`io/estrado/components/Helm.groovy`** | **`generateHelm`** — runs **`helm template`** and sets. |
+| **`io/estrado/components/Docker.groovy`** | Build + push to ECR (inside **`container('builder')`**). |
+| **`com/exotel/Constants.groovy`** | URLs, stage names, **`DEPLOYMENT_BRANCH = master`**, etc. |
+| **`IntegrationWorkflow` / `QAWorkflow` / `ProdWorkflow`** | **`generateHelmForStage`** per env name. |
+
+### 5.3 Control flow inside `DefaultJavaPipeline.Run` (order of calls)
+
+**Always first (both `pu` and `next`):**
+
+1. **`commonWorkflowSteps.cloneCodeRepos(args)`** — CQA into **`cqa-source/`**, **exotel_configs** (branch from args), optional sparse **exotel_code**.
+2. **`commonWorkflowSteps.cloneExotelDeploymentsRepo(args)`** — **exotel_deployments** (**`master`**).
+3. **`common.loadDefaultVariables(args)`** — **Load Git Environment**.
+4. **If** `buildJars` and branch ≠ qa: **`buildJars`** → `container('jdk')` Maven.
+5. **`lintDockerfile`** → `container('builder')` Hadolint.
+
+**Then** `if (pipelineMap.scmBranch == integrationBranch)` → **PU** path. **Else** → **NEXT** path.
+
+### 5.4 **PU** branch — method order (integration + image + tag)
+
+| Step | What runs (class / method) | Output |
+|------|----------------------------|--------|
+| 1 | **computeGitCommits** | Fills **`pipelineMap`** (commit id, **`md5OfMerge`** like `cqa-<prefix>-<timestamp>`). |
+| 2 | **imageBuildPreChecks** | **`searchGitTag`** in **exotel_deployments** → **`shouldBuildDockerImage`**, **`pipelineMap.imageTag`**. |
+| 3 | If build: **Docker.groovy** in **`container('builder')`** | Push image to **ECR**. |
+| 4 | **IntegrationWorkflow** / **`generateHelmForStage(..., 'integration')`** in **`container('helm')`** + **Helm.groovy** | **`helm template`** → integration manifests. |
+| 5 | **commitDeploymentFilesForTheStage(args, `'integration'`)** | Writes **`exotel_deployments/cqa/integration/`**, **git tag** on **master** (format in blueprint §6). |
+
+### 5.5 **next** branch — method order (promotion)
+
+| Step | What runs | Output |
+|------|-----------|--------|
+| 1 | **`input('Promote to QA and Production?')`** | Human gate. |
+| 2 | **New pod** — **cloneCodeRepos** + **cloneExotelDeploymentsRepo** again (fresh tip of **next**). |
+| 3 | **`generateHelmForStage(..., 'qa')`** + **commit** | **`cqa/qa/`**. |
+| 4 | **CommonWorkflowSteps.run** sequence: **computeGitCommits**, **searchGitTag**, **getImageVersionFromGitTag**, **reset exotel_configs to PU commit from tag**, **getDeploymentVersion** | Image + config for prod paths. |
+| 5 | **`generateHelmForStage(..., 'mum1')`** + commit | **`cqa/mum1/`**. |
+| 6 | **`generateHelmForStage(..., 'prod')`** + commit | **`cqa/prod/`**. |
+
+**Important:** **mum1/prod** use the **image + config state from the PU git tag**, not arbitrary **next** config (see blueprint §4.3 — reset to PU **configsCommitID** from tag).
+
+### 5.6 Containers (where tools run)
+
+| Container | Used for |
+|-----------|----------|
+| **`container('jdk')`** | Maven **buildJars** (typically **PU** only). |
+| **`container('builder')`** | Hadolint + **Docker** build/push. |
+| **`container('helm')`** | **copyConfigs**, **helm template** for integration / qa / mum1 / prod. |
+
+---
+
+## 6. Argo CD — how it points at the repo
+
+- One **Application** (or app-per-env) with:
+  - **repoURL** = Bitbucket `exotel_deployments`
+  - **path** = `cqa/qa` (or `cqa/prod`, etc.)
+  - **targetRevision** = `next` or `master` (must match what Jenkins pushes)
+- **Sync policy:** manual vs automated; **prune** / **selfHeal** per team policy.
+
+**Interview:** *“ArgoCD doesn’t run Helm; it applies **YAML already rendered** into Git. The **desired Helm** is in `exotel_configs`; **deployments** is the **rendered contract** for the cluster.”*
+
+---
+
+## 7. End-to-end timeline (commit → prod)
+
+1. **Merge** app change; on **`pu`**, pipeline may build/push image **`cqa:…`** to ECR and tag deployments (see §5.4).
+2. **`exotel_configs`** at the commit referenced by the **PU tag** drives later **mum1/prod** renders (blueprint §4.3).
+3. On **`next`**, after **`input`**, Jenkins **`helm template`** for **prod** → **`exotel_deployments/cqa/prod/`** → **git push** to **`master`** on that repo.
+4. **ArgoCD** detects commit (poll or webhook) → **sync** → cluster runs new Deployment.
+5. **Rollback:** revert commit in **`exotel_deployments`** or previous image tag in configs + re-run pipeline.
+
+---
+
+## 8. PU vs next vs master (how to phrase it)
+
+- **`pu`:** multibranch branch for **integration** — image build + **`values.integration.yaml`** → **`exotel_deployments/cqa/integration/`** + **PU tag** (see blueprint §5.4).
+- **`next`:** multibranch branch for **promotion** — **`input`**, then **qa** → **mum1** → **prod** renders; **mum1/prod** tie back to **PU tag** image/config (blueprint §5.5, §4.3).
+- **`master`:** **`exotel_deployments`** default branch for **clone/push/tag** — not “the branch that triggers prod Helm” by itself.
+
+---
+
+## 9. Related files under **Implementation/** (this repo)
+
+Paths are **relative to your clone** of the Implementation workspace — **not** `~/` or a fixed username.
+
+| Path (from workspace root) | Purpose |
+|-----------------------------|---------|
+| **`CQA/CQA-Deployment-Blueprint.md`** | **Authoritative** CQA pipeline: library classes, **PU** vs **next**, `container('helm')`, commit stages |
+| **`CQA/scripts/pull-render-and-compare.sh`** | Local **helm template** + diff (set `EXOTEL_CONFIGS` / `EXOTEL_DEPLOYMENTS` to your clone paths) |
+| **`CQA/scripts/README-compare.md`** | Rendered vs live folder layout |
+| **`CQA/CQA-Prod-Deployment-Live-vs-Desired.md`** | Drift: Helm desired vs `exotel_deployments` |
+| **`CQA-Pipeline-Tag-Collision-Bug.md`** | Real incident: `searchGitTag`, `md5OfMerge`, promotion |
+| **`CQA_Project_Guide/ADD_SCHEDULER_POD_TO_CQA.md`** | Chart-only changes; `Jenkinsfile.cqa` usually **unchanged** |
+
+---
+
+## 10. Checklist for the interview
+
+- [ ] **Three repos:** configs (Helm) → deployments (flat YAML) → ArgoCD (sync).
+- [ ] **Jenkins multibranch** ties **branch** to **which values file** and **which output path**.
+- [ ] **`helm template`** is the bridge; cluster never needs `helm install` if you only use ArgoCD + flat files.
+- [ ] Know **`checkout scm`** vs explicit second repo checkout.
+- [ ] **Rollback** = Git + ArgoCD, not only kubectl.
+
+---
+
+## Summary (from code commit — where approval fits)
+
+*Condensed from **`CQA/CQA-Deployment-Blueprint.md`** (stage tables, `input`, re-clone). This doc’s **§5** matches that file.*
+
+### 1. What a “commit” triggers
+
+- Code lands in the **CQA app repo** on branch **`pu`** or **`next`**. Jenkins **multibranch** runs **`Jenkinsfile.cqa`** → shared library **`jenkins-pipeline`** → **`DefaultJavaPipeline.Run`** (see **§5.1**).
+
+### 2. Classes in order (shared library `jenkins-pipeline`)
+
+**Entry (every run):**
+
+1. **`io.estrado.Pipeline`** — `runDefaultJavaPipeline(args)` → hands off.
+2. **`io.estrado.pipelines.DefaultJavaPipeline`** — **`Run(args)`**: podTemplate, stages, branch split **`pu`** vs **`next`**, and on **`next`** the **`input(...)`** approval step.
+
+**Shared steps (both branches, start of run):**
+
+3. **`com.exotel.CommonWorkflowSteps`** — `cloneCodeRepos`, `cloneExotelDeploymentsRepo`, `computeGitCommits`, `buildJars` (**`pu`** only when enabled), `lintDockerfile`, and on **`next`** after approval the **`run(...)`** sequence that drives tag lookup + config reset.
+4. **`common.loadDefaultVariables`** (library **common** helper) — load git/env into **`pipelineMap`**.
+5. **`com.exotel.JenkinsPipelineSteps`** — `copyConfigs`, `searchGitTag`, `getImageVersionFromGitTag`, **`commitDeploymentFilesForTheStage`** (git add/commit/tag/push on **`exotel_deployments`**).
+6. **`io.estrado.components.Helm`** — **`generateHelm`** (actual **`helm template`**).
+7. **`io.estrado.components.Docker`** — image build + ECR push (**`pu`**, inside **`container('builder')`**).
+8. **Env workflows** — **`IntegrationWorkflow`**, **`QAWorkflow`**, **`ProdWorkflow`** (or equivalent per env) — **`generateHelmForStage(..., 'integration'|'qa'|'mum1'|'prod')`** calling into **`Helm`**.
+9. **`com.exotel.Constants`** — URLs, branch names, deployment branch (**`master`**), not a “step” but read throughout.
+
+**Order rule:** **`DefaultJavaPipeline`** decides **PU** vs **NEXT**; everything else hangs off that. Full method-level tables: **§5.3–5.5**.
+
+### 3. Branch **`pu`** — flow + **classes/methods in order**
+
+1. **`CommonWorkflowSteps.cloneCodeRepos`** / **`cloneExotelDeploymentsRepo`** → **`common.loadDefaultVariables`**.
+2. **`buildJars`** (**`CommonWorkflowSteps`**, `container('jdk')`) if enabled — typically **`pu`** only.
+3. **`lintDockerfile`** (**`CommonWorkflowSteps`**, **`container('builder')`**).
+4. **`computeGitCommits`** (**`CommonWorkflowSteps`**) — fills **`pipelineMap`** (merge id / tag inputs).
+5. **Image path:** **`JenkinsPipelineSteps.searchGitTag`** + checks → if needed **`Docker`** build/push.
+6. **`IntegrationWorkflow.generateHelmForStage(..., 'integration')`** + **`Helm.generateHelm`** (`container('helm')`) → YAML for **`cqa/integration/`**.
+7. **`JenkinsPipelineSteps.commitDeploymentFilesForTheStage(..., 'integration')`** → push + **PU git tag** on **`exotel_deployments`**.
+
+**One line:** clone → (optional) **jdk** build → lint → **computeGitCommits** → (optional) **Docker** → **IntegrationWorkflow** + **Helm** → **commitDeploymentFilesForTheStage**.
+
+### 4. Branch **`next`** — flow + **classes/methods in order**
+
+**`next` does not build a new image** in the blueprint; promotion uses the **PU tag** for the current **`next`** commit.
+
+1. Same **start** as above: **`CommonWorkflowSteps`** clones + **`loadDefaultVariables`**, **no** `buildJars`, **`lintDockerfile`**.
+2. **`DefaultJavaPipeline`** — **`input('Promote to QA and Production?', ...)`** — **`qaApprovers`**, timeout (blueprint e.g. **5 days**). Pipeline **blocks** here.
+3. **New agent:** **`CommonWorkflowSteps.cloneCodeRepos`** + **`cloneExotelDeploymentsRepo`** again (tip of **`next` at approval time**).
+4. **`QAWorkflow.generateHelmForStage(..., 'qa')`** + **`Helm`** → **`commitDeploymentFilesForTheStage(..., 'qa')`**.
+5. **`CommonWorkflowSteps.run`** path + **`JenkinsPipelineSteps`**: **`computeGitCommits`**, **`searchGitTag`**, **`getImageVersionFromGitTag`**, reset **`exotel_configs`** to PU configs commit from tag, **`getDeploymentVersion`** — prepares image/config for mum1/prod.
+6. **`generateHelmForStage(..., 'mum1')`** + **`generateHelmForStage(..., 'prod')`** (workflow + **`Helm`**) → **`commitDeploymentFilesForTheStage`** for each.
+
+**One line:** clones + lint → **`DefaultJavaPipeline.input`** → re-clone → **QAWorkflow** + **Helm** + commit → **tag/reset sequence** (**`CommonWorkflowSteps`** + **`JenkinsPipelineSteps`**) → **Prod-style workflows** + **Helm** + commits.
+
+**Argo CD** is **not** approval; it **syncs** Git under `cqa/…`. **Human gate** = Jenkins **`input`** in **`DefaultJavaPipeline`**.
+
+### 5. End-to-end one-liner
+
+**`exotel_configs`** = Helm **desired** state; Jenkins **`helm template`** = **render** into **`exotel_deployments`**; **Argo CD** = **apply** rendered YAML to the cluster. Promotion correctness for mum1/prod is **pinned by the PU git tag**, not by whatever is casually on **`next`** alone.
+
+---
+
+*Helm: `HELM_MICROSERVICES_ISTIO_INTERVIEW.md`. K8s: `K8S_MANIFEST_SAMPLES.md`. Real pipeline detail: **`CQA/CQA-Deployment-Blueprint.md`** inside this workspace.*
