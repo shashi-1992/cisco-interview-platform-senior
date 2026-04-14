@@ -1,0 +1,457 @@
+## Folder layout (otel-ansible)
+
+```text
+otel/otel-ansible/
+├── otel.yml                    # playbook — runs roles (ansible-playbook … otel.yml)
+├── env-vars/                   # qa, prod
+├── hosts, hosts.qa
+└── roles/otel-collector/
+    ├── tasks/main.yml          # tasks for this role
+    ├── defaults/main.yml
+    ├── handlers/main.yml
+    ├── meta/main.yml
+    ├── templates/
+    └── vars/
+```
+
+**Main playbook (nothing runs without this):**  
+`/Users/shashidhara.reddy/Implementation/otel/otel-ansible/otel.yml`
+
+**Role tasks:** `otel/otel-ansible/roles/otel-collector/tasks/main.yml`
+
+**Collector config template:** `otel/otel-ansible/roles/otel-collector/templates/otel-config.yaml.j2`
+
+---
+
+## Full content — main playbook (`otel.yml`)
+
+Path: `/Users/shashidhara.reddy/Implementation/otel/otel-ansible/otel.yml`
+
+```yaml
+---
+- name: Deploy OpenTelemetry Collector
+  hosts: all
+  become: yes
+  become_method: sudo
+  user: exotel
+  gather_facts: yes
+
+  vars_files:
+    - env-vars/{{ env }}
+
+  vars:
+    service: "otel-collector"
+
+  pre_tasks:
+    - name: Set default environment
+      set_fact:
+        env: "{{ env | default('qa') }}"
+
+    - name: Set stamp/region
+      set_fact:
+        stamp: "{{ stamp | default('sg') }}"
+
+    - name: Gather EC2 facts
+      ec2_facts:
+      when: ansible_ec2_instance_id is defined
+      ignore_errors: yes
+
+  roles:
+    - otel-collector
+    - configure-common-packages
+    - { role: prometheus_node_exporter, tags: ["monitoring-setup"] }
+
+  tasks: []
+  post_tasks: []
+```
+
+## Full content — `ansible.cfg` (otel-ansible)
+
+Path: `/Users/shashidhara.reddy/Implementation/otel/otel-ansible/ansible.cfg`
+
+```ini
+[defaults]
+callback_whitelist = profile_tasks
+forks = 5
+timeout = 20
+host_key_checking = False
+roles_path = ./roles
+inventory = ./hosts
+retry_files_enabled = False
+
+[ssh_connection]
+ssh_args = -o ControlMaster=auto -o ControlPersist=60s
+pipelining = True
+```
+
+---
+
+# /Users/shashidhara.reddy/Implementation/otel/otel-ansible/roles/otel-collector/defaults/main.yml
+
+---
+# OpenTelemetry Collector - Default Variables
+# These can be overridden by vars/{{ env }} files
+
+# Package settings
+otel_version: "0.88.0"
+otel_package_name: "otelcol-contrib_{{ otel_version }}_linux_amd64.tar.gz"
+otel_download_from_s3: true
+
+# Directory paths
+otel_config_path: "/etc/otel"
+otel_data_path: "/var/lib/otel"
+
+# User settings
+otel_user: "exotel"
+otel_group: "exotel"
+
+# Endpoint settings
+otel_grpc_endpoint: "0.0.0.0:4317"
+otel_http_endpoint: "0.0.0.0:4318"
+otel_health_endpoint: "0.0.0.0:13133"
+otel_pprof_endpoint: "0.0.0.0:1777"
+otel_zpages_endpoint: "0.0.0.0:55679"
+otel_prometheus_endpoint: "0.0.0.0:8889"
+otel_metrics_address: "0.0.0.0:8888"
+
+# Exporter settings
+otel_export_to_jaeger: true
+otel_export_to_prometheus: true
+otel_export_to_otlp: false
+otel_jaeger_insecure: true
+otel_otlp_insecure: true
+
+# Prometheus settings
+otel_prometheus_namespace: "otel"
+
+# Resource limits
+otel_memory_limit_mib: 512
+otel_memory_spike_limit_mib: 128
+otel_memory_check_interval: "1s"
+
+# Batch processor settings
+otel_batch_timeout: "10s"
+otel_batch_size: 1024
+
+# Logging settings
+otel_log_level: "info"
+otel_service_log_level: "info"
+
+# Feature flags
+otel_enable_prometheus_receiver: false
+otel_enable_hostmetrics: false
+otel_enable_resource_processor: true
+otel_enable_logs_pipeline: false
+
+# Host metrics settings
+otel_hostmetrics_interval: "30s"
+otel_scrape_interval: "15s"
+
+# Service namespace
+otel_service_namespace: "exotel"
+
+# Garbage collection tuning
+otel_gogc: 80
+
+---
+
+# /Users/shashidhara.reddy/Implementation/otel/otel-ansible/roles/otel-collector/handlers/main.yml
+
+---
+- name: restart otel-collector
+  systemd:
+    name: otel-collector
+    state: restarted
+    daemon_reload: yes
+  become: yes
+
+- name: reload otel-collector
+  systemd:
+    name: otel-collector
+    state: reloaded
+  become: yes
+
+- name: stop otel-collector
+  systemd:
+    name: otel-collector
+    state: stopped
+  become: yes
+
+- name: start otel-collector
+  systemd:
+    name: otel-collector
+    state: started
+  become: yes
+
+---
+
+# /Users/shashidhara.reddy/Implementation/otel/otel-ansible/roles/otel-collector/meta/main.yml
+
+---
+galaxy_info:
+  author: Exotel Infrastructure Team
+  description: OpenTelemetry Collector installation and configuration
+  company: Exotel
+  license: proprietary
+  min_ansible_version: 2.9
+  platforms:
+    - name: EL
+      versions:
+        - 7
+        - 8
+    - name: Amazon
+      versions:
+        - all
+  galaxy_tags:
+    - monitoring
+    - observability
+    - opentelemetry
+    - tracing
+    - metrics
+
+dependencies: []
+
+---
+
+# /Users/shashidhara.reddy/Implementation/otel/otel-ansible/roles/otel-collector/tasks/main.yml
+
+---
+- name: Include environment specific vars
+  include_vars:
+    file: "{{ env }}"
+
+- name: Create otel user
+  user:
+    name: otel
+    system: yes
+    shell: /sbin/nologin
+    create_home: no
+  become: yes
+
+- name: Create otel directories
+  file:
+    path: "{{ item }}"
+    state: directory
+    owner: "{{ otel_user | default('exotel') }}"
+    group: "{{ otel_group | default('exotel') }}"
+    mode: '0755'
+  with_items:
+    - "{{ otel_config_path }}"
+    - "{{ otel_data_path }}"
+    - /var/log/otel
+
+- name: Download OTel Collector from S3
+  s3:
+    bucket: "{{ s3_build_bucket_name }}"
+    object: "otel/{{ otel_package_name }}"
+    dest: "/tmp/{{ otel_package_name }}"
+    mode: get
+    region: "{{ ansible_ec2_placement_region | default(aws_region) }}"
+  become: yes
+  when: otel_download_from_s3 | default(true)
+
+- name: Download OTel Collector from URL
+  get_url:
+    url: "{{ otel_download_url }}"
+    dest: "/tmp/{{ otel_package_name }}"
+    mode: '0644'
+  when: not (otel_download_from_s3 | default(true))
+
+- name: Extract OTel Collector
+  unarchive:
+    src: "/tmp/{{ otel_package_name }}"
+    dest: /usr/local/bin/
+    remote_src: yes
+    creates: /usr/local/bin/otelcol-contrib
+  become: yes
+  notify: restart otel-collector
+
+- name: Set permissions on OTel binary
+  file:
+    path: /usr/local/bin/otelcol-contrib
+    owner: root
+    group: root
+    mode: '0755'
+  become: yes
+
+- name: Deploy OTel Collector config
+  template:
+    src: otel-config.yaml.j2
+    dest: "{{ otel_config_path }}/config.yaml"
+    owner: "{{ otel_user | default('exotel') }}"
+    group: "{{ otel_group | default('exotel') }}"
+    mode: '0644'
+    validate: '/usr/local/bin/otelcol-contrib validate --config=%s'
+  notify: restart otel-collector
+  ignore_errors: yes
+
+- name: Deploy OTel Collector config (without validation)
+  template:
+    src: otel-config.yaml.j2
+    dest: "{{ otel_config_path }}/config.yaml"
+    owner: "{{ otel_user | default('exotel') }}"
+    group: "{{ otel_group | default('exotel') }}"
+    mode: '0644'
+  notify: restart otel-collector
+
+- name: Deploy systemd service file
+  template:
+    src: otel-collector.service.j2
+    dest: /etc/systemd/system/otel-collector.service
+    mode: '0644'
+  become: yes
+  notify: restart otel-collector
+
+- name: Reload systemd daemon
+  systemd:
+    daemon_reload: yes
+  become: yes
+
+- name: Enable and start OTel Collector service
+  systemd:
+    name: otel-collector
+    enabled: yes
+    state: started
+  become: yes
+
+- name: Create logrotate config for OTel
+  copy:
+    dest: /etc/logrotate.d/otel-collector
+    content: |
+      /var/log/otel/*.log {
+          daily
+          rotate 7
+          compress
+          delaycompress
+          missingok
+          notifempty
+          create 0644 {{ otel_user | default('exotel') }} {{ otel_group | default('exotel') }}
+          postrotate
+              systemctl reload otel-collector > /dev/null 2>&1 || true
+          endscript
+      }
+    mode: '0644'
+  become: yes
+
+- name: Clean up downloaded package
+  file:
+    path: "/tmp/{{ otel_package_name }}"
+    state: absent
+
+---
+
+# /Users/shashidhara.reddy/Implementation/otel/otel-ansible/roles/otel-collector/templates/otel-collector.service.j2
+
+[Unit]
+Description=OpenTelemetry Collector
+Documentation=https://opentelemetry.io/docs/collector/
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User={{ otel_user | default('exotel') }}
+Group={{ otel_group | default('exotel') }}
+ExecStart=/usr/local/bin/otelcol-contrib --config={{ otel_config_path }}/config.yaml
+Restart=always
+RestartSec=5
+TimeoutStartSec=30
+TimeoutStopSec=30
+
+# Resource limits
+LimitNOFILE=65536
+LimitNPROC=4096
+{% if otel_memory_limit is defined %}
+MemoryLimit={{ otel_memory_limit }}
+{% endif %}
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+
+# Environment variables
+Environment="GOGC={{ otel_gogc | default(80) }}"
+{% if otel_extra_env is defined %}
+{% for env_var in otel_extra_env %}
+Environment="{{ env_var.name }}={{ env_var.value }}"
+{% endfor %}
+{% endif %}
+
+[Install]
+WantedBy=multi-user.target
+
+---
+
+# /Users/shashidhara.reddy/Implementation/otel/otel-ansible/roles/otel-collector/templates/otel-config.yaml.j2
+
+
+
+---
+
+# /Users/shashidhara.reddy/Implementation/otel/otel-ansible/roles/otel-collector/vars/prod
+
+---
+# OpenTelemetry Collector - Production Environment Variables
+
+# Package settings
+otel_version: "0.88.0"
+otel_package_name: "otelcol-contrib_0.88.0_linux_amd64.tar.gz"
+otel_download_from_s3: true
+otel_download_url: "https://s3-ap-southeast-1.amazonaws.com/exotel-nexus/otel/otelcol-contrib_0.88.0_linux_amd64.tar.gz"
+
+# Directory paths
+otel_config_path: "/etc/otel"
+otel_data_path: "/var/lib/otel"
+
+# User settings
+otel_user: "exotel"
+otel_group: "exotel"
+
+# Endpoint settings
+otel_grpc_endpoint: "0.0.0.0:4317"
+otel_http_endpoint: "0.0.0.0:4318"
+otel_health_endpoint: "0.0.0.0:13133"
+otel_prometheus_endpoint: "0.0.0.0:8889"
+otel_metrics_address: "0.0.0.0:8888"
+
+# Exporter settings
+otel_export_to_jaeger: true
+otel_export_to_prometheus: true
+otel_export_to_otlp: false
+jaeger_endpoint: "jaeger.internal.exotel.in:14250"
+otel_jaeger_insecure: true
+
+# Resource limits
+otel_memory_limit_mib: 1024
+otel_memory_spike_limit_mib: 256
+otel_memory_check_interval: "1s"
+
+# Batch processor settings
+otel_batch_timeout: "10s"
+otel_batch_size: 2048
+
+# Logging settings
+otel_log_level: "warn"
+otel_service_log_level: "info"
+
+# Feature flags
+otel_enable_prometheus_receiver: false
+otel_enable_hostmetrics: true
+otel_enable_resource_processor: true
+otel_enable_logs_pipeline: false
+
+# Service namespace
+otel_service_namespace: "exotel-prod"
+
+# Garbage collection tuning
+otel_gogc: 100
+
+---
+
+# /Users/shashidhara.reddy/Implementation/otel/otel-ansible/roles/otel-collector/vars/qa
+
+
+
+---
