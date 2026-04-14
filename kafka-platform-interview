@@ -1,0 +1,1140 @@
+# Kafka — deployment, operations, CC streams & ksqlDB
+
+**Sources:** Internal runbooks / cheatsheets (e.g. Arushi Madaan, Aadit Bhojgi, Praveen Kumar, jeevant bihari, Archit Sinha, Kashish). **Single file** — basics, VM/Ansible getafix, broker install, EKS migration, offset reprocessing, CC streams/KSQL, ksqlDB HA, **cheatsheet** (PromQL, CLI, ops). Confirm IPs, ports, and RPM names in your environment.
+
+---
+
+## 1. Kafka basics (clusters, events, CLI)
+
+**By Praveen Kumar** (internal doc). Kafka is a **distributed** system: **servers** and **clients** talk over a high-performance **TCP** protocol. It runs on bare metal, VMs, or containers (on-prem or cloud).
+
+- **Servers:** A **cluster** of one or more brokers (often across DCs/regions). Brokers are the **storage layer**.
+- **Clients:** Apps and microservices that **produce**, **consume**, and **process** event streams in parallel, at scale, with fault tolerance when the network or machines fail.
+
+**Event (record / message):** Something that happened — conceptually **key**, **value**, **timestamp**, optional **headers**.
+
+Example (business event):
+
+```text
+Event key: "Alice"
+Event value: "Made a payment of $200 to Bob"
+Event timestamp: "Jun. 25, 2020 at 2:06 p.m."
+```
+
+Example (JSON payload shape):
+
+```json
+{
+  "data": {
+    "callId": "d208-6364a7cf-vcall-4",
+    "userActualChannel": "SIP/1001-000000a6",
+    "userCallContextId": 6,
+    "userCallContextName": "1001_DefaultVR",
+    "userPhone": "12345",
+    "crtObjectId": "d208-6364a7cf-ses-artUserNov03_1-3jD9Rxro-1-uce-12345@6",
+    "callLegId": "d208-6364a7cf-out-call-leg-1001_DefaultVR1020",
+    "event_time": 1667542294894
+  },
+  "id": "d208-6364a7cf-vcall-4",
+  "event": "USER_CALL_LEG_CONNECTED"
+}
+```
+
+- **Producers** publish (write) events to Kafka.
+- **Consumers** subscribe (read/process) events.
+- **Topics:** Events are stored in **topics** (think: folder; events ≈ files in the folder).
+- **Partitions:** Topics are **split across brokers** (“buckets”) for **scale** — many clients can read/write in parallel.
+
+### 1.1 Start Kafka (tarball / local dev layout)
+
+Order matters — **ZooKeeper first**, then **broker** (legacy ZK mode; **KRaft** uses §4+ in this doc).
+
+```bash
+bin/zookeeper-server-start.sh config/zookeeper.properties
+```
+
+Another terminal:
+
+```bash
+bin/kafka-server-start.sh config/server.properties
+```
+
+RPM installs on servers typically use **`systemctl`** (see **§9** KRaft start, **§11** ZooKeeper legacy).
+
+### 1.2 Consumer groups (CLI)
+
+```bash
+# List groups
+bin/kafka-consumer-groups.sh --bootstrap-server localhost:9092 --list
+
+# Describe a group
+bin/kafka-consumer-groups.sh --bootstrap-server localhost:9092 --describe --group voice-call-events-group
+
+# Members (who is in the group)
+bin/kafka-consumer-groups.sh --describe --group voice-call-events-group --members --bootstrap-server localhost:9092
+```
+
+Without `--members`, `--describe` shows consumers, **partition** assignment, and **offsets**.
+
+### 1.3 Topics (CLI)
+
+```bash
+bin/kafka-topics.sh --bootstrap-server=localhost:9092 --list
+
+bin/kafka-topics.sh --bootstrap-server=localhost:9092 --describe --topic VOICE_CALL_EVENTS
+
+bin/kafka-console-consumer.sh --bootstrap-server localhost:9092 --topic VOICE_CALL_EVENTS --from-beginning
+```
+
+Increase partitions:
+
+```bash
+bin/kafka-topics.sh --bootstrap-server localhost:9092 --alter --topic VOICE_CALL_EVENTS --partitions 2
+```
+
+### 1.4 Dump topic to a file
+
+```bash
+bin/kafka-console-consumer.sh --bootstrap-server 10.10.17.210:9092 --topic voice-call-raw-events --from-beginning > cold_transfer_events_3.txt
+```
+
+### 1.5 Offsets — describe and reset
+
+**Describe** a group:
+
+```bash
+bin/kafka-consumer-groups.sh --bootstrap-server 10.0.0.190:9092 \
+  --group cg-vla-conversion-pipeline-de-conversion-processing --describe
+```
+
+**Reset:** the consumer group must have **no running consumers**, or the broker rejects the reset. Use **`--dry-run`** first where supported; add **`--execute`** to apply.
+
+Common reset modes (see `kafka-consumer-groups.sh --help` for the full set):
+
+| Option | Meaning |
+|--------|---------|
+| `--shift-by <n>` | Move offset forward/back by `n` |
+| `--to-current` | Reset to current position |
+| `--to-latest` | Jump to end |
+| `--to-offset <n>` | Exact offset |
+| `--to-datetime <string>` | e.g. `2022-11-02T00:00:00.000` |
+| `--by-duration <ISO-8601>` | e.g. `PT0H30M0S` (30 minutes back from “now” at reset time) |
+| `--all-topics` | Apply to every topic the group subscribes to |
+
+Examples:
+
+```bash
+bin/kafka-consumer-groups.sh --bootstrap-server localhost:9092 --group <group_name> \
+  --reset-offsets --shift-by -10 --topic <topic_name> --dry-run
+
+bin/kafka-consumer-groups.sh --bootstrap-server localhost:9092 --group <group_name> \
+  --reset-offsets --shift-by -10 --topic <topic_name> --execute
+```
+
+```bash
+bin/kafka-consumer-groups.sh --bootstrap-server localhost:9092 --group <group_name> \
+  --reset-offsets --all-topics --to-datetime 2022-11-02T00:00:00.000 --dry-run
+```
+
+```bash
+bin/kafka-consumer-groups.sh --bootstrap-server localhost:9092 --group <group_name> \
+  --reset-offsets --all-topics --by-duration PT0H30M0S --execute
+```
+
+Production-style reprocessing (appserver/data-engine stopped, validation, rollback) is in **§13**.
+
+### 1.6 Reference links
+
+| Topic | Link |
+|-------|------|
+| **Kafka — Quickstart** | [kafka.apache.org/quickstart](https://kafka.apache.org/quickstart) |
+| **Kafka — Documentation (intro / redirect hub)** | [kafka.apache.org/documentation](https://kafka.apache.org/documentation/) |
+| **Why is Kafka fast?** (Alex Xu, ByteByteGo) | [blog.bytebytego.com/p/why-is-kafka-fast](https://blog.bytebytego.com/p/why-is-kafka-fast) |
+| **Alex Xu** (posts on X) | [x.com/alexxubyte](https://x.com/alexxubyte) |
+| **System design** angle on Kafka performance | Same ByteByteGo article above; also search “system design why is kafka fast” for interview notes |
+
+**ISO-8601 durations** (Kafka `--by-duration`, tools): pattern **`PnDTnHnMnS`** — e.g. **`P2DT3H4M`** = 2 days, 3 hours, 4 minutes (minutes/seconds can be omitted per grammar).
+
+| Topic | Link |
+|-------|------|
+| **Duration** (Apache Log4j 2 — example parser / ISO-8601 duration in tooling) | [Log4j Core `Duration` Javadoc](https://logging.apache.org/log4j/2.x/javadoc/log4j-core/org/apache/logging/log4j/core/appender/rolling/action/Duration.html) (older stacks; prefer **`java.time.Duration`** where possible) |
+
+---
+
+## 2. Get the build
+
+| Source | URL / path |
+|--------|------------|
+| **Primary** | RMS — under **Kafka**: `http://192.168.2.31:8081/rms/` |
+| **Fallback** | VegaOps CI jobs: `https://ameyo.vegaops.com/ameyo_cloud_stack/kafka/-/jobs/` |
+
+Download **`kafka-<Latest>.x86_64.rpm`** (or the artifact name your pipeline publishes).
+
+---
+
+## 3. VM + Ansible (getafix) — Kafka / ZooKeeper setup
+
+**By jeevant bihari** (internal doc). End-to-end for **new broker VMs** deployed via **SRO** and installed with **getafix** + Jenkins (ZooKeeper + Kafka; **not** KRaft-only paths in §4+).
+
+### 3.1 Configure the VM
+
+1. Get VM details from **SRO** with a data disk mounted at **`/data`**.
+2. Add the **Jenkins** machine **public key** to the VM (so deploy jobs can SSH).
+
+### 3.2 `exotel` user and SSH
+
+```bash
+sudo bash
+su - exotel
+ssh-keygen   # follow prompts if key does not exist
+cd /home/exotel/.ssh
+touch authorized_keys
+chmod 600 authorized_keys
+```
+
+Append the **Jenkins** (or CI deploy) machine **public** key as a **single line** in `authorized_keys`. Copy the current key from your **Jenkins credential / secrets store** — **do not** paste real keys into this document.
+
+### 3.3 Install Kafka (Ansible / `exotel_code`)
+
+1. Create a branch from **`kafka_activity_dc`** in the **`exotel_code`** repo.
+2. Edit **`getafix/trunk/ansible/kafka-<cluster>`** (inventory for that cluster). It lists **Kafka broker** and **ZooKeeper** nodes.
+3. Under **`[Kafka]`**: remove old broker lines and add **new** nodes. **Keep `[ZooKeeper]` entries unchanged** unless you are intentionally changing ZK.
+
+Example **Kafka** host lines (replace with your IPs/hostnames):
+
+```text
+kafka-common-test-1 ansible_host=172.30.2.37 ansible_user=exotel hostname=kafka-common-test-1.internal.mum1.exotel.in broker_id=0 public_ip=172.30.2.37 tag_name=kafka-common-test
+kafka-common-test-2 ansible_host=172.30.2.42 ansible_user=exotel hostname=kafka-common-test-2.internal.mum1.exotel.in broker_id=1 public_ip=172.30.2.42 tag_name=kafka-common-test
+```
+
+### 3.4 Verify template — `server.properties.j2`
+
+Path: **`getafix/trunk/ansible/roles/kafka/templates/server.properties.j2`**
+
+Confirm at least:
+
+```text
+log.retention.hours=168
+offsets.retention.minutes=10080
+```
+
+### 3.5 Verify cluster vars
+
+Check the cluster **vars** file for: **`chroot_path`**, **`heap_size`**, **internal zone id**, **public zone id** (match your environment / DNS).
+
+### 3.6 Deploy (Jenkins)
+
+Job (example — confirm URL still valid):
+
+`https://build.mum1.exotel.in:8080/job/prod-kafka-zookeeper-deploy`
+
+### 3.7 After installation — checklist
+
+| Check | Notes |
+|-------|--------|
+| Log retention policy | Matches template / business need |
+| **Broker id** | **Unique** on every node |
+| Kafka hostname | Resolves as expected |
+| ZooKeeper hostname(s) | Correct ensemble |
+| **ZooKeeper port** **2181**; **Kafka** **9092** | Firewall / listeners |
+| Attached volume size on Kafka nodes | Especially under `/data` or role-defined paths |
+| Number of partitions | Topic plan |
+| Auto-creation of topics | Policy matches prod rules |
+| **`zookeeper.connect`** in Kafka settings | Points at live ZK chroot (e.g. `/common_kafka`) |
+| Kafka + ZooKeeper **log file locations** | Disk usage monitoring |
+| **GC log** + **logrotate** | e.g. **`/etc/sysconfig/kafka-server`** |
+
+### 3.8 Confirm brokers registered in ZooKeeper
+
+If `zookeeper-shell.sh` is on **`PATH`** (as in some Confluence snippets):
+
+```bash
+zookeeper-shell.sh zookeeper-common-dc-1.mum1.exotel.com:2181,zookeeper-common-dc-2.mum1.exotel.com:2181,zookeeper-common-dc-3.mum1.exotel.com:2181/common_kafka ls /brokers/ids
+```
+
+Typical install (explicit path):
+
+```bash
+/opt/kafka/bin/zookeeper-shell.sh \
+  zookeeper-common-dc-1.mum1.exotel.com:2181,zookeeper-common-dc-2.mum1.exotel.com:2181,zookeeper-common-dc-3.mum1.exotel.com:2181/common_kafka \
+  ls /brokers/ids
+```
+
+Example output:
+
+```text
+WatchedEvent state: SyncConnected type: None path: null
+[0, 1, 2, 3, 4]
+```
+
+```bash
+echo dump | nc localhost 2181 | grep broker
+```
+
+Example (paths may vary):
+
+```text
+/common_kafka/brokers/ids/1
+/common_kafka/brokers/ids/0
+```
+
+### 3.9 Service status
+
+```bash
+sudo service kafka-server status
+```
+
+(`systemctl` equivalent may apply on newer images.)
+
+### 3.10 Smoke test (topic + produce + consume)
+
+Create a topic (ZooKeeper connect string and chroot must match your cluster):
+
+```bash
+/opt/kafka/bin/kafka-topics.sh --create \
+  --zookeeper zookeeper-common-dc-1.mum1.exotel.com:2181,zookeeper-common-dc-2.mum1.exotel.com:2181,zookeeper-common-dc-3.mum1.exotel.com:2181/common_kafka \
+  --replication-factor 1 --partitions 1 --topic TestTopic
+```
+
+Produce:
+
+```bash
+echo "Hello, World" | /opt/kafka/bin/kafka-console-producer.sh \
+  --broker-list 172.30.2.37:9092 --topic TestTopic >/dev/null
+```
+
+Consume — use the **same topic name** as create (`TestTopic`). *(Confluence typo had `--topic Tes`; that will not match `TestTopic`.)*
+
+```bash
+/opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server 172.30.2.37:9092 --topic TestTopic --from-beginning
+```
+
+---
+
+## 4. Kafka with KRaft — install RPM
+
+```bash
+rpm -ivh /Downloads/kafka-<Latest>.x86_64.rpm
+```
+
+Adjust path if the RPM is not under `/Downloads/`.
+
+---
+
+## 5. Configure `server.properties` (single **and** multi-broker)
+
+```bash
+vim /root/ameyo/kafka/config/kraft/server.properties
+```
+
+Default install layout here is **`/root/ameyo/kafka`**.
+
+---
+
+## 6. Multi-broker only — add / update
+
+| Property | Rule | Example |
+|----------|------|---------|
+| **`node.id`** | **Unique** on every node in the cluster; often **1 … N** | `1`, `2`, `3` |
+| **`controller.quorum.voters`** | On **all** controller **and** broker nodes: `id@host:port` list | `controller.quorum.voters=1@localhost:9093,2@localhost:9095,3@localhost:9097` |
+| **`offsets.topic.replication.factor`** | `N` = number of **brokers** | `offsets.topic.replication.factor=3` |
+| **`transaction.state.log.replication.factor`** | Same `N` | `transaction.state.log.replication.factor=3` |
+| **`transaction.state.log.min.isr`** | Often **`N-1`**; if **&lt; 3 brokers**, use **1** | `transaction.state.log.min.isr=2` (example when N=3) |
+| **`listeners`** | Client + controller listeners | `listeners=PLAINTEXT://localhost:9092,CONTROLLER://localhost:9093` (replace host/port as needed) |
+| **`advertised.listeners`** | What clients use | `advertised.listeners=PLAINTEXT://localhost:9092` |
+| **`min.insync.replicas`** | Often **`N-1`**; if **&lt; 3 brokers**, use **1** | `min.insync.replicas=2` (example when N=3) |
+| **`default.replication.factor`** | `N` brokers | `default.replication.factor=3` |
+
+**3-node example (2 controllers + 1 broker):** set **`controller.quorum.voters`** consistently on **all three** nodes to the three `id@ip:port` entries (see Confluence diagram).
+
+---
+
+## 7. Cluster ID — one-time per cluster
+
+Each Kafka cluster must have a **distinct** `clusterId`.
+
+```bash
+cd /root/ameyo/kafka
+/root/ameyo/kafka/bin/kafka-storage.sh random-uuid
+```
+
+Save the UUID output.
+
+---
+
+## 8. Format log directories (KRaft)
+
+Use the **same** `clusterId` on **every** node in that cluster.
+
+```bash
+/root/ameyo/kafka/bin/kafka-storage.sh format -t <clusterId> -c /root/ameyo/kafka/config/kraft/server.properties
+```
+
+Replace `<clusterId>` with the value from §7.
+
+---
+
+## 9. Start Kafka and verify
+
+```bash
+systemctl start kafka.service
+systemctl status kafka.service
+```
+
+---
+
+## 10. Create topics **before** dependent services
+
+Procedure is documented under **Kafka Patch**.
+
+1. Install the **latest patch build** on the Kafka host(s).  
+   **Pipelines:** `https://ameyo.vegaops.com/ameyo_cloud_stack/patch/-/pipelines`
+
+2. Run topic script (example):
+
+```bash
+sh /root/var/ameyo/dacxdata/kafka-patch/config/topic-create.sh <kafka_host> <kafka_port>
+```
+
+### Local setup (kafka-patch repo)
+
+- **Clone:** `https://ameyo.vegaops.com/ameyo_cloud_stack/kafka-patch`
+- Edit **`topic-create.py`**:
+  - Set number of agents (e.g. `"50"`)
+  - `host_with_port = "localhost:9092"`
+  - Set **conf directory** to the full path of `kafka-patch/configFiles`
+
+---
+
+## 11. Kafka with ZooKeeper (legacy)
+
+**Install RPM (example from runbook):**
+
+```bash
+rpm -ivh /home/heenakothari/rpm/kafka-2.13-2.8.1_1.x86_64.rpm
+```
+
+**Start ZK, then Kafka:**
+
+```bash
+systemctl start kafka-zookeeper.service
+systemctl status kafka-zookeeper.service
+
+systemctl start kafka.service
+systemctl status kafka.service
+```
+
+Align **`server.properties`** (and related config) with **Kafka Configuration Production Setup** (internal doc).
+
+---
+
+## 12. EC2 → EKS migration (Strimzi — phased plan)
+
+High-level phases for moving Kafka to **EKS (Strimzi)** with **observability** (JMX, Prometheus), **log shipping** (Fluent Bit dual-write), and **Logstash → OpenSearch** aligned before **producer cutover** and **decommissioning EC2**.
+
+| Phase | Key steps |
+|-------|-----------|
+| **1** | List topics, consumer groups, producers; capture **`server.properties`** (baseline). |
+| **2** | **EKS + Strimzi**; **Kafka** CR + **KafkaNodePool**; topics; **NLB + DNS**; connectivity tests. |
+| **3** | Align broker/topic config with **EC2** behaviour; scale **replicas / resources / storage**. |
+| **4** | **JMX** on **9090**; expose via **NLB** or **NodePort**; **Prometheus** scrape + alerts/dashboards. |
+| **5** | **Fluent Bit:** add EKS **OUTPUT**s (dual write); approval; deploy/restart; verify **both** clusters receive logs. |
+| **6** | **Logstash:** point to EKS (or dual read); fix **DNS** if needed; rollout restart; verify in **OpenSearch**. |
+| **7** | **Switch producers to EKS only**; validate; **decommission EC2 Kafka**. |
+
+**Interview hooks (one line each):** (1) Discovery — inventory + config snapshot. (2) Strimzi CRs + node pools; NLB fronts bootstrap. (3) Parity — RF, retention, ISR, capacity vs legacy. (4) JMX → Prometheus; secure exposure. (5) Dual-write de-risks until verification. (6) Logstash/OpenSearch must resolve brokers (DNS). (7) Producers last — avoid starving EC2 consumers.
+
+*Order:* do not point Logstash or producers to EKS-only until phases 2–4 (and usually 5–6) prove stable.
+
+---
+
+## 13. Kafka events reprocessing (Reports, VLA, data-engine)
+
+**Source:** Aadit Bhojgi (internal doc). Steps to **reset consumer group offsets** for a topic so services can **reprocess** Kafka events.
+
+### When reprocessing is needed
+
+- **Voicelog:** Re-archive failed voice logs after fixing an auth (or similar) error so old recordings are available.
+- **Calling / reports:** Mismatch between **history** vs **reports** / **supervisor stats** — e.g. DB outage or a **data-engine** consumer bug. After a fix, **new** events are fine; **old** events must be reprocessed so reports/stats align.
+
+---
+
+### 13.1 Reprocess calling events
+
+| | **Default** | **RELEASE_6_1 only** |
+|---|-------------|------------------------|
+| **Topic** | `communication-raw-events` | `voice-call-raw-events` |
+| **Group** | `cg-communication-raw-events-de-event-staging` | `cg-voice-call-raw-events-de-event-staging` |
+
+**Before you start**
+
+1. **Backup data-engine DB** if rollback may be needed (from bastion):
+
+```bash
+ssh -i /path/to/bastion-or-jump-host-key azureuser@<public-ip>
+psql -U postgres -h <your-citus-ip>
+```
+
+```bash
+pg_dump -U postgres -h <citus-ip> -d data_db -f abc.sql
+```
+
+2. **Scale appserver to 0** — set `replicas: 0` in appserver `values.yml`.
+3. Wait **15–20 minutes** after calling has stopped; confirm topic **LAG** is acceptable (large existing lag slows reprocessing).
+4. **Scale data-engine to 0** — `replicas: 0` in data-engine `values.yml`.
+5. **Note `CURRENT-OFFSET`** per partition (`--describe`) for rollback.
+
+**No active consumers** on the topic/group before reset. On the Kafka host:
+
+```bash
+/root/ameyo/kafka/bin/kafka-consumer-groups.sh --bootstrap-server localhost:9092 \
+  --group cg-communication-raw-events-de-event-staging --describe
+```
+
+`CONSUMER-ID`, `HOST`, `CLIENT-ID` should be **empty** (no active members). Example line:
+
+```text
+... PARTITION  CURRENT-OFFSET  LOG-END-OFFSET  LAG  CONSUMER-ID  HOST  CLIENT-ID
+... 0            444             444             0    -            -     -
+```
+
+**Reset offsets** — always **`--dry-run` first**, then **`--execute`**.
+
+`--to-datetime` (format `yyyy-MM-ddTHH:mm:ss.xxx`):
+
+```bash
+/root/ameyo/kafka/bin/kafka-consumer-groups.sh --bootstrap-server <kafka_broker_host:9091> \
+  --group <group-id> --reset-offsets --to-datetime 2024-01-01T00:00:00.000 \
+  --topic <topic-name> --dry-run
+
+/root/ameyo/kafka/bin/kafka-consumer-groups.sh --bootstrap-server <kafka_broker_host:9091> \
+  --group <group-id> --reset-offsets --to-datetime 2024-01-01T00:00:00.000 \
+  --topic <topic-name> --execute
+```
+
+`--by-duration` (ISO-8601 duration, e.g. `PT0H10M0S` = 10 minutes back):
+
+```bash
+/root/ameyo/kafka/bin/kafka-consumer-groups.sh --bootstrap-server <kafka_broker_host:9091> \
+  --group <group_name> --reset-offsets --by-duration PT0H10M0S \
+  --topic <topic-name> --dry-run
+
+/root/ameyo/kafka/bin/kafka-consumer-groups.sh --bootstrap-server <kafka_broker_host:9091> \
+  --group <group_name> --reset-offsets --by-duration PT0H10M0S \
+  --topic <topic-name> --execute
+```
+
+Other reset options: [Kafka docs — reset parameters](https://kafka.apache.org/24/documentation/streams/developer-guide/app-reset-tool.html).
+
+**Precaution:** reset a **small window first** (e.g. ~5 minutes), validate reports/stats/VLA, then widen if needed.
+
+**Verify offsets:**
+
+```bash
+/root/ameyo/kafka/bin/kafka-consumer-groups.sh --bootstrap-server <kafka_host:port> \
+  --group <group-id> --describe
+```
+
+After reset, **LAG** ≈ number of events to reprocess.
+
+**Start data-engine**, validate e.g. `acd_call_details_denormalized`, `call_conference_report`, and **`dead-letter-queue.log`**. Known noise: some **conference** / **LP / Omni calculator** errors during reprocessing — often ignorable per release notes; confirm with L4 if unsure.
+
+**Success:** LAG drains to **0**; reports/stats look correct. Then **start appserver** and sanity-check.
+
+**Rollback**
+
+1. Stop data-engine (and appserver if needed).
+2. Reset offset **back** to saved `CURRENT-OFFSET` (`--to-offset`):
+
+```bash
+/root/ameyo/kafka/bin/kafka-consumer-groups.sh --bootstrap-server <kafka_broker_host:9091> \
+  --group <group_name> --reset-offsets --to-offset <initial-offset-value> \
+  --topic <topic-name> --dry-run
+
+/root/ameyo/kafka/bin/kafka-consumer-groups.sh --bootstrap-server <kafka_broker_host:9091> \
+  --group <group_name> --reset-offsets --to-offset <initial-offset-value> \
+  --topic <topic-name> --execute
+```
+
+3. Start appserver, then data-engine; validate new calls. Restore **`pg_dump`** if DB inconsistency requires it.
+4. Escalate to **L4** with logs/data before re-attempting reprocessing.
+
+**Order after successful reprocessing:** start **data-engine** first, then **appserver**, then sanity.
+
+---
+
+### 13.2 Reprocess voicelog events (Supervisor UI)
+
+Use when failed archives are **few** and you want **no data-engine downtime**.
+
+1. Supervisor → **Voicelogs** — search by status.
+2. **Play** a row: triggers play API → if not archived, **re-archives** then returns audio.
+3. **Supervisor → Manage** — campaign-wise same behaviour.
+
+---
+
+### 13.3 Resetting VLA Kafka topic offset
+
+Stop **all data-engine** pods first.
+
+| Goal | Topic | Group |
+|------|--------|--------|
+| **Metadata + VLA conversion** (calculated data + unarchived `NULL`/`FAILED`) | `vla-va-call-denormalized-calculated` | `cg-vla-va-call-denormalized-calculated-de-dumper` |
+| **VLA conversion only** (unarchived `NULL`/`FAILED`) | `vla-conversion-pipeline` | `cg-vla-conversion-pipeline-de-conversion-processing` |
+
+Substitute topic/group into the same reset patterns as §13.1.
+
+`--to-datetime`:
+
+```bash
+/root/ameyo/kafka/bin/kafka-consumer-groups.sh --bootstrap-server <kafka_broker_host:9091> \
+  --group <group-id> --reset-offsets --to-datetime 2024-01-01T00:00:00.000 \
+  --topic <topic-name>
+
+/root/ameyo/kafka/bin/kafka-consumer-groups.sh --bootstrap-server <kafka_broker_host:9091> \
+  --group <group-id> --reset-offsets --to-datetime 2024-01-01T00:00:00.000 \
+  --topic <topic-name> --execute
+```
+
+`--by-duration`:
+
+```bash
+/root/ameyo/kafka/bin/kafka-consumer-groups.sh --bootstrap-server <kafka_broker_host:9091> \
+  --group <group_name> --reset-offsets --by-duration PT0H10M0S --topic <topic-name>
+
+/root/ameyo/kafka/bin/kafka-consumer-groups.sh --bootstrap-server <kafka_broker_host:9091> \
+  --group <group_name> --reset-offsets --by-duration PT0H10M0S --topic <topic-name> --execute
+```
+
+Verify:
+
+```bash
+/root/ameyo/kafka/bin/kafka-consumer-groups.sh --bootstrap-server <kafka_host:port> \
+  --group <group-id> --describe
+```
+
+Start data-engine; validate **`va_call_denormalized_table`** and Supervisor Voicelogs; check data-engine logs for errors.
+
+---
+
+## 14. Contact Center — Kafka Streams & KSQL (Superset / analytics)
+
+**By Aadit Bhojgi** (internal doc). Available **Kafka streams** for the **Contact Center** platform and usage notes for **customer-specific** **KSQL** pipelines.
+
+These streams hold **structured, real-time** event data for calls, agents, sessions, monitoring, and user activity — sources for **real-time analytics, dashboards, reports, and alerts**.
+
+Confirm stream/table names in your cluster (`SHOW STREAMS;` / `SHOW TABLES;`).
+
+### 14.1 Core streams (high level)
+
+| Stream / topic pattern | Purpose | Typical use cases |
+|-------------------------|---------|-------------------|
+| **call-history**, **user_disposition_history**, **user_call_history** | Historical + real-time call events and dispositions | Call journey, agent resolution, interaction audit |
+| **agent-productivity-interval-calculated-5min** | 5-minute agent productivity | KPIs, hourly productivity |
+| **campaign-session-interval-calculated-10min** | 10-minute campaign session summaries | Campaign performance, trends |
+| **user-session-raw-events** | Raw user status timeline (login, break, call start/end, etc.) | Availability, real-time dashboards, adherence |
+
+### 14.2 Call-related streams (detailed)
+
+| Stream name | Purpose |
+|-------------|---------|
+| **CALL_HISTORY__STREAM** | All call events with timestamps and identifiers |
+| **CALL_METRICS_FLATTENED__STREAM** | Flattened call metrics for aggregation / reports |
+| **USER_CALL_DETAILS_CC__STREAM** | Call-level details for a CC user |
+| **USER_DISPOSITION_HISTORY__STREAM** | Dispositions / outcomes over time |
+
+### 14.3 User session and activity streams
+
+| Stream name | Purpose |
+|-------------|---------|
+| **USER_SESSION_CC__STREAM** | High-level CC user session |
+| **CC_USER_SESSION_RAW_EVENTS__STREAM** | Raw status events (login, logout, breaks, …) for timelines |
+| **CC_SESSION_INTERVAL_RAW__STREAM** | Raw interval-based session data |
+| **CC_SESSION_INTERVAL_5MIN_RAW__STREAM** | 5-minute session windows (raw) |
+
+### 14.4 Monitoring and system information streams
+
+Often exposed as **Superset** datasets by default.
+
+| Stream name | Purpose |
+|-------------|---------|
+| **MONITORING_CHAT_INFORMATION_FLATTENED__STREAM** | Real-time chat activity (flattened for easy joins) |
+| **MONITORING_CUSTOMER_INFORMATION_FLATTENED__STREAM** | Static/dynamic customer attributes for reports |
+| **MONITORING_USER_RUNTIME_INFORMATION_FLATTENED__STREAM** | Live user runtime state (operations dashboards) |
+| **MONITORING_USER_SESSION_INFORMATION_FLATTENED__STREAM** | Detailed session view for monitoring user engagement |
+
+### 14.5 Campaign and interaction streams
+
+| Stream name | Purpose |
+|-------------|---------|
+| **CC_APR_30_MIN_INTERVAL_FLATTENED__STREAM** | 30-minute campaign APR-style metrics |
+| **OMNI_INTERACTION_DENORMALIZED_5_MIN_FLATTENED__STREAM** | Omni-channel interactions (calls, chat, email), flattened |
+
+### 14.6 Default stats / report **KTables** (AVRO keys & values)
+
+These **Kafka tables** are for **long-term** aggregations and monitoring. Keys and values use **AVRO**. Typical uses: **aggregated metrics for dashboards and alerts**. Often available as **Superset** datasets by default.
+
+| KTable name | Purpose |
+|-------------|---------|
+| **AGENT_SELF_MONITORING__STATS** | Self-monitoring per agent (e.g. idle time, status changes) for performance and adherence |
+| **AGENT_TIMELINE__STATS** | Status detail for a user on a campaign — login, break, call, etc. |
+| **AGGREGATED_CC_APR__REPORT** | Pre-aggregated **APR** (Automatic Performance Report) for CC performance reports |
+| **QUEUE_MONITORING_12_HR__STATS** | Queue-level metrics over **12 hours** (wait times, queue lengths) for SLA and monitoring |
+
+### 14.7 How to use these streams (KSQL)
+
+Streams are **inputs** to **KSQL** pipelines, which:
+
+1. **Aggregate** data over time windows  
+2. **Filter** and **enrich** based on business logic  
+3. **Join** metadata (user info, customer details, etc.)  
+4. **Output** derived metrics into new Kafka topics or downstream systems  
+
+**Practice:** KSQL queries are **version-controlled**; keep **customer-specific** logic **modular** for reuse.
+
+| Step | What happens |
+|------|----------------|
+| **Input** | Streams above → KSQL pipelines |
+| **Process** | Windows, filter, enrich, joins |
+| **Output** | New topics or downstream systems |
+
+**Interview (one line each):**
+
+- **Stream** — append-only changelog; **Table** — materialized state (often aggregation).
+- **KSQL/ksqlDB** — SQL on Kafka streams; streaming joins and windowed queries.
+
+*Platform naming uses `__STREAM` / `__STATS` suffixes; confirm exact names in your cluster’s KSQL `SHOW STREAMS;` / `SHOW TABLES;`.*
+
+---
+
+## 15. ksqlDB on Kubernetes — HA, StatefulSet, PVC migration
+
+Operational notes for **ksqlDB** with **Kafka Streams** state (`/var/lib/kafka-streams`, RocksDB). A single shared PVC is fine for **one** replica; scaling **without** per-pod storage is **unsafe**.
+
+### 15.1 Why one PVC (`ksqldb-fs-pvc`) is dangerous for `replicas > 1`
+
+Two pods must **never** write the same RocksDB directory. Scaling a **Deployment** that mounts **one** PVC to multiple pods → **data corruption risk**.
+
+With **no standby replicas**, you have **no warm copies**. On failure:
+
+- Full **rebuild from changelog**
+- **Slow** recovery
+- Higher **Kafka** read load
+
+### 15.2 Minimal, safe changes to enable HA
+
+**MUST DO (summary)**
+
+| # | Change | Why |
+|---|--------|-----|
+| 1 | **`replicaCount: 2`** (start with 2, not 3) | Routing + ownership redistribution; smaller blast radius while testing |
+| 2 | **Deployment → StatefulSet** | Stable identity; **one PVC per pod**; RocksDB isolation — **do not scale the current Deployment in place** |
+| 3 | **`volumeClaimTemplates`** (per-pod volume) | Replace single `persistentVolumeClaim.claimName: ksqldb-fs-pvc` — **most important HA fix** |
+| 4 | **`KSQL_KSQL_ADVERTISED_HOSTNAME`** + headless Service | Stable DNS for **pull-query forwarding** between pods; metadata in Kafka command topic |
+| 5 | **`KSQL_KSQL_STREAMS_NUM_STANDBY_REPLICAS: "1"`** | Warm state-store copies; failover **seconds** vs full changelog rebuild |
+| 6 | **Pod anti-affinity** (`topologyKey: kubernetes.io/hostname`) | Spread pods across nodes; node loss ≠ total loss |
+| 7 | **PDB** `minAvailable: 1` | Drains / voluntary disruption don’t take all pods |
+| 8 | **`KSQL_KSQL_HEARTBEAT_ENABLE: "true"`** | Faster liveness; avoids “ghost” proxy connections after idle timeout / restarts |
+
+**Replica count:** use **2** first (not production-scale 3) to validate routing and ownership.
+
+**StatefulSet + storage (conceptual):**
+
+```yaml
+volumeClaimTemplates:
+  - metadata:
+      name: kafka-ksqldb-storage
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      storageClassName: ksqldb-exoxtrm-file-storage   # example — use your class
+      resources:
+        requests:
+          storage: <size>
+```
+
+**Headless Service** (for advertised hostname — **no impact** on external clients or ClusterIP load balancing; internal routing only):
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: ksqldb-headless
+spec:
+  clusterIP: None
+  selector:
+    app: ksqldb
+  ports:
+    - port: 8088
+```
+
+**Helm-style env + config** — do **not** hardcode hostnames; use pod DNS:
+
+| Key / env | Purpose |
+|-----------|---------|
+| `KSQL_KSQL_ADVERTISED_HOSTNAME` | `$(POD_NAME).ksqldb-headless.$(POD_NAMESPACE).svc.cluster.local` |
+| `POD_NAME` | `fieldRef: metadata.name` |
+| `POD_NAMESPACE` | `fieldRef: metadata.namespace` |
+
+Example `configMapPairs` + `extraEnv`:
+
+```yaml
+configMapPairs:
+  KSQL_KSQL_ADVERTISED_HOSTNAME: "$(POD_NAME).ksqldb-headless.$(POD_NAMESPACE).svc.cluster.local"
+  KSQL_KSQL_STREAMS_NUM_STANDBY_REPLICAS: "1"
+  KSQL_KSQL_HEARTBEAT_ENABLE: "true"
+
+extraEnv:
+  - name: POD_NAME
+    valueFrom:
+      fieldRef:
+        fieldPath: metadata.name
+  - name: POD_NAMESPACE
+    valueFrom:
+      fieldRef:
+        fieldPath: metadata.namespace
+```
+
+**Anti-affinity (soft):**
+
+```yaml
+affinity:
+  podAntiAffinity:
+    preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 100
+        podAffinityTerm:
+          labelSelector:
+            matchLabels:
+              app: ksqldb
+          topologyKey: kubernetes.io/hostname
+```
+
+**Standby replicas — behavior**
+
+| Scenario | Rebuild from changelog? | Downtime | Kafka load |
+|----------|-------------------------|----------|------------|
+| Pod crash **with** warm standby | No (promotion) | Very low | Low |
+| Pod crash **without** standby | Yes (affected partitions) | Higher | High |
+| Scale **new** pod | Yes for new tasks | None for existing | Medium |
+
+**Heartbeats:** reduce “ghost” pull-query connections when Pod B died but Pod A still thinks it is reachable (long idle timeouts). Heartbeats update cluster metadata so routing fails fast with a **rebalancing** style error instead of a long HTTP timeout.
+
+| Aspect | Client traffic | Load balancing | Internal routing | HA correctness | Risk |
+|--------|----------------|----------------|------------------|----------------|------|
+| Headless + advertised hostname | No change | No change (still ClusterIP for clients) | Improves | Improves | Very low |
+
+### 15.3 PVC migration strategies (Deployment → StatefulSet)
+
+When moving from **one** PVC to **per-pod** volumes:
+
+| | **Option A — reuse existing PVC for `ksqldb-0`** | **Option B — all fresh PVCs** |
+|---|-----------------------------------------------|-------------------------------|
+| **One-time rebuild** | Only **new** pods (`ksqldb-1`, …) rebuild from changelog | **Every** pod rebuilds |
+| **Migration time** | Faster | Slow (can be hours) |
+| **Kafka load** | Lower for migration | High (“restore storm”) |
+| **Operational complexity** | Medium (bind `ksqldb-0` to old claim correctly) | High simplicity conceptually |
+| **Legacy state risk** | Slight if old RocksDB was bad | None (“factory reset”) |
+
+**Choose Option A** when state is healthy, changelog is large, you want minimal downtime — typical **Kafka Streams–friendly** default.
+
+**Choose Option B** when you accept long downtime, suspect corruption, topology/schema changed hard, or you want zero legacy risk.
+
+### 15.4 Reference — `df -h /var/lib/kafka-streams/` (sample clusters)
+
+Illustrates how **used** space varies by workload on similar **100G** Azure Files–backed PVCs:
+
+```text
+# BDT-DEV-0072fa7d8f
+Filesystem      Size  Used Avail Use%  Mounted on
+//.../pvc-c19ec26b-5192-451e-8fa1-abe63e61c2f0   100G   12M  100G   1%   /var/lib/kafka-streams
+
+# Engg-preprod-cluster-6x
+//.../pvc-ba4fc607-7390-4ae4-8811-e86f3b91b5fd   100G  1.3G   99G   2%   /var/lib/kafka-streams
+
+# exotel-ameyoemerge-cluster-6x
+//.../pvc-b8419f60-512e-494b-922d-38e997a8ba66   100G   86G   15G  86%   /var/lib/kafka-streams
+```
+
+Plan **capacity** and **migration windows** using real usage, not empty PVC size alone.
+
+---
+
+## 16. Kafka cheatsheet (Prometheus, CLI, ops)
+
+Compiled from internal notes (**Archit Sinha**, **Kashish** / shared `Kafka_notes`). Examples use **historic lab IPs/hostnames** — substitute yours. **Never commit real passwords**; samples below use placeholders.
+
+### 16.1 PromQL — consumer lag (Kafka Exporter / compatible metrics)
+
+**Lag by partition — alert when lag &gt; 20** (example: topic `ExternalLegEvent_TN_MH`, group `hermix-group-leg-tn-mh`):
+
+```promql
+sum by (consumergroup, partition) (
+  max by (consumergroup, topic, partition) (
+    kafka_consumergroup_lag{
+      topic="ExternalLegEvent_TN_MH",
+      consumergroup="hermix-group-leg-tn-mh"
+    }
+  )
+) > 20
+```
+
+**Lag rolled up by topic** (same topic/group filters):
+
+```promql
+sum by (consumergroup, topic) (
+  max by (consumergroup, topic, partition) (
+    kafka_consumergroup_lag{
+      topic="ExternalLegEvent_TN_MH",
+      consumergroup="hermix-group-leg-tn-mh"
+    }
+  )
+)
+```
+
+Maintain a **topic ↔ consumer group** matrix per environment (add to your runbook or config repo).
+
+### 16.2 Example host inventory (ES test — illustrative)
+
+| Role | Example host | Example IP |
+|------|----------------|-------------|
+| Kafka | `kafka-es-test-1` … `3` | `10.0.46.202`, `10.0.41.154`, `10.0.41.176` |
+| Logstash | `logstash-es-test-1` … `3` | `10.0.41.158`, `10.0.41.165`, `10.0.41.159` |
+
+### 16.3 Kafka / ZooKeeper — quick checks
+
+**Broker JAR / version hint:**
+
+```bash
+cd /opt/kafka/libs && ls kafka*
+```
+
+**ZooKeeper alive:**
+
+```bash
+echo stat | nc <zookeeper_ip> 2181
+```
+
+**Broker registrations in ZK:**
+
+```bash
+echo dump | nc <zookeeper_ip> 2181 | grep brokers
+```
+
+**ZK mode (leader vs follower):**
+
+```bash
+echo stat | nc <zookeeper_ip> 2181 | grep Mode
+```
+
+### 16.4 Start servers (tarball layout under `/opt/kafka`)
+
+```bash
+cd /opt/kafka/bin
+./zookeeper-server-start.sh ../config/zookeeper.properties
+```
+
+```bash
+cd /opt/kafka/bin
+./kafka-server-start.sh /etc/kafka/config/server.properties
+```
+
+Paths vary by image (`server.properties` may live under `/root/ameyo/kafka` etc. — see §4–§5).
+
+### 16.5 Topics — create, describe, list
+
+Create (ZK-style; include **chroot** if your cluster uses one, e.g. `/messaging_kafka`):
+
+```bash
+./kafka-topics.sh --create --topic <topic_name> \
+  --zookeeper <zk_host:2181>/messaging_kafka \
+  --replication-factor 1 --partitions 1
+```
+
+Describe:
+
+```bash
+/opt/kafka/bin/kafka-topics.sh --describe --zookeeper localhost:2181 --topic <topic_name>
+```
+
+List one / all / describe all / **under-replicated** / **unavailable** partitions:
+
+```bash
+bin/kafka-topics.sh --list --zookeeper localhost:2181 --topic topic1
+bin/kafka-topics.sh --list --zookeeper localhost:2181
+bin/kafka-topics.sh --describe --zookeeper localhost:2181 --topic topic1
+bin/kafka-topics.sh --describe --zookeeper localhost:2181
+bin/kafka-topics.sh --describe --zookeeper localhost:2181 --under-replicated-partitions
+bin/kafka-topics.sh --describe --zookeeper localhost:2181 --unavailable-partitions
+```
+
+### 16.6 Consumer groups — lag and membership
+
+```bash
+/opt/kafka/bin/kafka-consumer-groups.sh --bootstrap-server <host:9092> --describe --group <group>
+/opt/kafka/bin/kafka-consumer-groups.sh --bootstrap-server <host:9092> --list
+/opt/kafka/bin/kafka-consumer-groups.sh --bootstrap-server <host:9092> --describe --group <group> --members
+```
+
+**Offsets stored in ZooKeeper** (legacy `offsets.storage=zookeeper`):
+
+```bash
+bin/kafka-consumer-groups.sh --zookeeper localhost:2181 --list
+```
+
+**Console consumer:**
+
+```bash
+/opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server localhost:9092 --topic <topic> --from-beginning
+```
+
+**Hermix-style lag — partitions with lag &gt; 5** (requires `client.properties` if cluster uses SASL/TLS):
+
+```bash
+kafka-consumer-groups.sh --bootstrap-server 127.0.0.1:9092 \
+  --command-config /tmp/client-test.properties --group hermix-group-leg --describe \
+  | awk 'NR==1 || $6 > 5'
+```
+
+**Bootstrap with auth** (example pattern):
+
+```bash
+/opt/kafka/bin/kafka-consumer-groups.sh --bootstrap-server 127.0.0.1:9092 \
+  --command-config /tmp/client-test.properties --group hermix-group-leg-dl --describe
+```
+
+### 16.7 Partition reassignment (add broker, rebalance)
+
+1. Generate plan from topic list JSON + target broker list:
+
+```bash
+/opt/kafka/bin/kafka-reassign-partitions.sh \
+  --topics-to-move-json-file topic_list.json \
+  --broker-list "0,1,2,3" --generate \
+  --zookeeper 10.0.46.7:2181 > assignment_details
+```
+
+2. Review output (**current** vs **proposed**); keep the old plan for rollback.
+
+3. Execute:
+
+```bash
+./kafka-reassign-partitions.sh --reassignment-json-file desired_partitions.json \
+  --execute --zookeeper 10.0.46.202:2181
+```
+
+JSON shape (illustrative):
+
+```json
+{
+  "version": 1,
+  "partitions": [
+    { "topic": "server-metrics1", "partition": 18, "replicas": [1, 12] },
+    { "topic": "server-metrics1", "partition": 621, "replicas": [12, 0] }
+  ]
+}
+```
+
+Verify with `--describe --topic … | grep "Partition: …"`.
+
+### 16.8 Danger zone — delete topic data in ZooKeeper
+
+**Destructive.** Prefer supported **`kafka-topics.sh --delete`** where enabled. Manual ZK delete example:
+
+```bash
+/opt/kafka/bin/zookeeper-shell.sh localhost:2181
+ls /brokers/topics
+rmr /brokers/topics/<topic_name>
+```
+
+Also see operational write-ups (e.g. [Contactsunny — manual topic delete](https://contactsunny.medium.com/manually-delete-apache-kafka-topics-424c7e016ff3)).
+
+### 16.9 ZK ensemble errors (`Connection refused` during leader election)
+
+- Ensure distinct **`myid`** per ZK node (`/var/lib/zookeeper/myid` or image-specific path).
+- Check **quorum** ports / firewall between ZK peers.
+
+### 16.10 `broker-list` vs `bootstrap-servers`
+
+- **Producer (old):** `--broker-list` — full broker list; missing brokers can break produce.
+- **Consumer / modern CLI:** `--bootstrap-server` — usually **one** reachable broker is enough to discover metadata.
+- **Zookeeper connection string:** `host:port` or `h1:2181,h2:2181,h3:2181/chroot` — see [Kafka docs — `zookeeper.connect`](https://kafka.apache.org/documentation/#brokerconfigs_zookeeper.connect).
+
+### 16.11 Consumer config — timeouts (interview / tuning)
+
+| Concept | Role |
+|---------|------|
+| `heartbeat.interval.ms` | Time between heartbeats to the group coordinator |
+| `session.timeout.ms` | How long without heartbeat before the member is considered dead |
+| `request.timeout.ms` | Client-side request timeout |
+| `max.poll.interval.ms` | Max delay between `poll()` calls while processing; exceed → rebalance |
+
+Rough rule: **process crash** often detected in ~`session.timeout.ms`; **slow processing** is bounded by **`max.poll.interval.ms`**. See [KAFKA-3806](https://issues.apache.org/jira/browse/KAFKA-3806) and current broker defaults for **offset retention**.
+
+### 16.12 Retention / topic config
+
+```bash
+./kafka-configs.sh --zookeeper <zk_connect/chroot> --alter \
+  --entity-type topics --entity-name <topic> \
+  --add-config 'retention.ms=86400000'
+
+./kafka-configs.sh --zookeeper <zk_connect/chroot> --alter \
+  --entity-type topics --entity-name <topic> --delete-config retention.ms
+
+./kafka-topics.sh --describe --zookeeper <zk_connect/chroot> --topics-with-overrides
+```
+
+### 16.13 Kafka metrics — JMX Prometheus agent + Kafka Exporter (pattern)
+
+**JMX agent** (example — paths/versions per cluster):
+
+```ini
+# /etc/systemd/system/kafka-server.service (Environment=)
+Environment="KAFKA_OPTS=-javaagent:/home/exotel/kafka_monitoring/jmx_prometheus_javaagent-<ver>.jar=7071:/home/exotel/kafka_monitoring/kafka-jmx.yml"
+```
+
+Then: `sudo systemctl daemon-reload && sudo systemctl restart kafka-server`.
+
+**Kafka Exporter** (community binary) — **do not paste real passwords**; use a **client properties** file or secret store:
+
+```bash
+./kafka_exporter --kafka.server=localhost:9092 \
+  --sasl.enabled --sasl.mechanism=plain \
+  --sasl.username=<user> --sasl.password=<secret> \
+  --tls.enabled --tls.ca-file=/path/to/ca.pem \
+  --tls.insecure-skip-tls-verify
+```
+
+Minimal dev:
+
+```bash
+./kafka_exporter --kafka.server=kafka:9092 --sasl.enabled=true
+```
+
+Releases: [danielqsj/kafka_exporter](https://github.com/danielqsj/kafka_exporter/releases).
+
+### 16.14 Related — Elasticsearch ops (same historical cheatsheet)
+
+Useful when Kafka + Logstash + ES are operated together:
+
+```bash
+curl -s "localhost:9200/_cat/nodes?v"
+curl -s "localhost:9200/_cat/indices?v"
+curl -s "localhost:9200/_cat/shards?v"
+curl -s "localhost:9200/<index>/settings?pretty"
+```
+
+Exclude a node from allocation (maintenance):
+
+```bash
+curl -XPUT localhost:9200/_cluster/settings -H 'Content-Type: application/json' -d '{
+  "transient": { "cluster.routing.allocation.exclude._ip": "<ip>" }
+}'
+```
+
+### 16.15 Further pointers
+
+- [Confluent — replication / operations](https://www.confluent.io/blog/hands-free-kafka-replication-a-lesson-in-operational-simplicity/)
+- [Gist — ZK / Kafka ops snippets](https://gist.github.com/ursuad/e5b8542024a15e4db601f34906b30bb5)
+
+---
+
+*Internal URLs require VPN / VegaOps access. Replace localhost examples with real hostnames in production.*
