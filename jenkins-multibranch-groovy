@@ -1,0 +1,4109 @@
+## Folder layout (sources: your local clones, not Implementation)
+
+```text
+/Users/shashidhara.reddy/cqa/
+└── Jenkinsfile.cqa              # ← Jenkins Script Path / multibranch entry
+
+/Users/shashidhara.reddy/jenkins-pipeline/
+└── src/                         # shared library (branch feature/pipeline-v4-cqa3)
+    ├── com/exotel/*.groovy
+    ├── infra/ecr/*.groovy
+    └── io/estrado/*.groovy
+```
+
+| Role | Path |
+|------|------|
+| **Pipeline entry (what Jenkins loads)** | `/Users/shashidhara.reddy/cqa/Jenkinsfile.cqa` |
+| **`runDefaultJavaPipeline`** | `/Users/shashidhara.reddy/jenkins-pipeline/src/io/estrado/Pipeline.groovy` |
+| **CQA orchestration** | `/Users/shashidhara.reddy/jenkins-pipeline/src/io/estrado/pipelines/DefaultJavaPipeline.groovy` |
+
+---
+
+## Full content — `Jenkinsfile.cqa`
+
+Path: `/Users/shashidhara.reddy/cqa/Jenkinsfile.cqa`
+
+```groovy
+#!/usr/bin/groovy
+@Library('jenkins-pipeline@feature/pipeline-v4-cqa3')
+io.estrado.Pipeline workflow = new io.estrado.Pipeline()
+def params = [
+    serviceName: "cqa",
+    buildJars: "true",
+    dockerfilePath: ".",
+    configFilePath: "exotel_configs/cqa",
+    extraConfigPaths: ["exotel_configs/commonix/lib/jqix/*", "exotel_configs/commonix/lib/memcached/*"],
+    dockerfile: "Dockerfile",
+    ecrRepo: "350027074327.dkr.ecr.ap-southeast-1.amazonaws.com/cqa",
+    overrideImageTag: "",
+    additionalHelmFlags: "",
+    qaApprovers: "sezaljain,nikhil-k,danysalmon,saijayanth_p,shashankhegde,sriram,darshandatt,ronak_goti,yogiraj,eknathyadav123,aishwary_singh",
+    integrationBranch: "pu",
+    integrationStage: "integration",
+    qaBranch: "next",
+    enableMavenCache: "true",
+    downloadExotelCode: "false",
+    jdkVersion: "21",
+    mavenVersion: "3.9.6",
+    
+    // NEW Maven-direct parameters (replacing Makefile parameters):
+    mavenGoals: "clean package",
+    mavenProfiles: "",
+    skipTests: "true",
+    mavenOptions: "-Xmx2048m",
+    
+    // CQA-specific parameters:
+    // cqaBranch: "master",                 // ← REMOVED: Now determined dynamically based on pipeline branch
+   // exotelConfigBranch: "pu"
+]
+workflow.runDefaultJavaPipeline(params)
+
+```
+
+---
+
+## Full content — `jenkins-pipeline/src/` (all `.groovy` files)
+
+Each section below is `# <absolute path>` then file body (from your clone).
+
+---
+
+# /Users/shashidhara.reddy/jenkins-pipeline/src/com/exotel/CommonWorkflowSteps.groovy
+
+package com.exotel
+
+def run(def pipelineStep, Map args) {
+    def pipelineMap = [:]
+    echo 'Running common pipeline steps'
+        computeGitCommits(pipelineStep, pipelineMap, args)
+
+    stage('Search git tag for last merge md5Hash') {
+        sshagent(['cicd-exotel']) {
+            dir('exotel_deployments') {
+                pipelineMap.tag = pipelineStep.searchGitTag(pipelineMap.md5OfMerge, args.serviceName)
+                if (pipelineMap.tag == '' || pipelineMap.tag == null) {
+                    sh(label: 'FAILURE MESSAGE: Could not find git tag for this merge', script: 'echo This merge commit in nextrelease branch has some additional changes compared to last proposedupdates branch build for this service. Check your changes')
+                    throw new Exception('I cannot run this build')
+                } else {
+                    echo "Git tag for md5Hash: ${pipelineMap.md5OfMerge} is ${pipelineMap.tag}"
+                }
+            }
+        }
+    }
+
+    stage('Fetch image tag from git tag') {
+        container('builder') {
+            pipelineStep.sourceRegistryCredentials()
+            pipelineMap.imageTag = pipelineStep.getImageVersionFromGitTag(pipelineMap.tag)
+            echo "The last image tag was ${pipelineMap.imageTag} and this is computed from the git tag ${pipelineMap.tag}"
+        }
+    }
+    stage('Reset exotel_configs to PU state') {
+        //Pu might have been tested with a service commit id and config commit id
+        // now checkout to the same config commit id while generating files for qa and prod
+        // We will have to see if we need this
+        dir(args.configFilePath) {
+            String configCommitIDInPU = pipelineMap.tag.split('-')[3].trim()
+            sh """
+            git reset --hard ${configCommitIDInPU}
+            """
+            //change the config commit id. This is the same exotel_configs commit id with which pu branch was built
+            args['configsCommitID'] = configCommitIDInPU
+        }
+    }
+
+    getDeploymentVersion(pipelineStep, args)
+
+    return pipelineMap
+}
+
+// use this stage to
+// 1. Check if the build was triggered from a merge commit. abort the build otherwise.
+// 2. Check if the there are changes between master and the branch, abort otherwise since
+// there will be an image already for this code
+// 3. To get merge commitId
+// 4. To get md5hash fo the merge
+// 5. To get merged branch name
+// 6. To get last commit Id on merged branch
+def computeGitCommits(def pipelineStep, Map pipelineMap, Map args) {
+    stage('Compute Git Commits') {
+        if (args.serviceName == 'cqa') {
+            // For CQA applications, use simplified git checks
+            dir('cqa-source') {
+                echo "CQA: Using simplified git checks (skipping complex operations)"
+                
+                // Get basic commit information
+                pipelineMap.mergeCommitID = pipelineStep.getCommitId()
+                echo "CQA: Commit ID: ${pipelineMap.mergeCommitID}"
+                
+                // Use simplified branch detection
+                try {
+                    pipelineMap.mergedBranch = pipelineStep.getMergedBranch(pipelineMap.mergeCommitID)
+                    echo "CQA: Branch: ${pipelineMap.mergedBranch}"
+                } catch (Exception e) {
+                    echo "CQA: Error getting branch, using fallback"
+                    pipelineMap.mergedBranch = "cqa-branch"
+                }
+                
+                // Commit ID must lead so searchGitTag's substring(0,7) gets all 7 hex chars
+                pipelineMap.md5OfMerge = "${pipelineMap.mergeCommitID.substring(0, 7)}-cqa-${System.currentTimeMillis()}"
+                echo "CQA: Generated MD5: ${pipelineMap.md5OfMerge}"
+                
+                // Use commit ID directly
+                pipelineMap.commitID = pipelineMap.mergeCommitID.substring(0, 7)
+                echo "CQA: Using commit ID: ${pipelineMap.commitID}"
+                
+                echo "CQA: Simplified git checks completed successfully"
+            }
+        } else {
+            // For other services, use current directory
+            pipelineMap.mergeCommitID = pipelineStep.getCommitId()
+            pipelineMap.mergedBranch = pipelineStep.getMergedBranch(pipelineMap.mergeCommitID)
+            if (pipelineStep.checkMergeCommit(pipelineMap.mergeCommitID) == false) {
+                throw new Exception('The pipeline has not been triggered by a Merge commit. Aborting build ')
+            }
+            pipelineMap.md5OfMerge = pipelineStep.generateMd5HashOfCommitDiff(pipelineMap.mergeCommitID)
+            pipelineMap.commitID = pipelineStep.getFirstSubcommitOfaMerge(pipelineMap.mergeCommitID)
+        }
+    }
+}
+
+// This stage is the precheck stage that evaluate some rules to decide the docker image build
+// common check is to find whether the commitID has a corresponding docker image. otherwise get the
+// last image tag
+def imageBuildPreChecks(def pipelineStep, Map pipelineMap, Map args) {
+    stage('Docker Image Build - Prechecks') {
+        pipelineMap.shouldBuildDockerImage = false
+        String tag
+        sshagent(['cicd-exotel']) {
+            dir('exotel_deployments') {
+                // tag - top 1 tag where the tag name contains the serviceName and the md5Hash
+                tag = pipelineStep.searchGitTag(pipelineMap.md5OfMerge, args.serviceName)
+                if (tag == '' || tag == null) {
+                    echo "There are no tags present for this diff's md5Hash ${pipelineMap.md5OfMerge} and the keyword ${args.serviceName}"
+                    pipelineMap.shouldBuildDockerImage = true
+                } else {
+                    pipelineMap.imageTag = pipelineStep.getImageVersionFromGitTag(tag)
+                    echo "Existing Image version for md5Hash: ${pipelineMap.md5OfMerge} is ${pipelineMap.imageTag} and this is computed from the git tag"
+                }
+            }
+        }
+
+        if (pipelineMap.shouldBuildDockerImage) {
+            // Since the tag is not present for this md5Hash, now an new docker image has to built for this md5Hash
+            // to tag the docker image, use the last docker tag and increment it
+            container('builder') {
+                pipelineStep.sourceRegistryCredentials()
+                String lastDockerTag = pipelineStep.getLastImageVersionFromECR(args)
+                echo "Last image tag found from ECR is : ${lastDockerTag}"
+                pipelineMap.imageTag = lastDockerTag
+            }
+        }
+    }
+}
+
+def buildAndPushDockerImage(def pipelineStep, Map pipelineMap, Map args) {
+    def userInputOnDockerFailure
+    boolean exceptionDuringDockerPush = false
+    stage('Docker Image Build and Push') {
+        // For CQA applications, use cqa-source directory
+        if (args.serviceName == 'cqa') {
+            dir('cqa-source') {
+                // Copy configs before Docker build (needed for files/ directory)
+                echo "Copying configuration files for CQA..."
+                pipelineStep.copyConfigs(args)
+                container('builder') {
+                    pipelineStep.sourceRegistryCredentials()
+                    // compute the image tag
+                    // give priority for an overrideImage tag from the Jenkinsfile
+                    // this also overrides the imageTag computed from the last build
+                    if (args.overrideImageTag != '' && args.overrideImageTag != null) {
+                        pipelineMap.imageTag = args.overrideImageTag
+                    }
+                    // buildImage will build with "latest" tag
+                    pipelineStep.buildImage(args.ecrRepo, args.dockerfile, ".")
+                    
+                    try {
+                        // Note: If the docker image push fails , alert the user
+                        tagAndPushImageToECR(pipelineStep, args, pipelineMap.imageTag)
+                    } catch (Exception ex) {
+                        echo 'Image push to the registy has failed'
+                        echo "Exception Message: ${ex}"
+                        if (args.buildEnv != Constants.DEVBOX_STAGE) {
+                            userInputOnDockerFailure = input id: 'InputOnDockerFailure', message: 'Failure while pushing docker image to ECR ? What would you like to do ?', parameters: [choice(choices: ['Recompute the docker image id automatically'], description: '', name: 'choices')], submitterParameter: 'approvedUser'
+                            echo "User has approved ${userInputOnDockerFailure.approvedUser}"
+                            echo "The user choice is ${userInputOnDockerFailure['choices']}"
+                            exceptionDuringDockerPush = true
+                        } else {
+                            throw ex
+                        }
+                    }
+                }
+            }
+        } else {
+            // For other services, use the specified dockerfilePath
+            dir(args.dockerfilePath) {
+                container('builder') {
+                    pipelineStep.sourceRegistryCredentials()
+                    // compute the image tag
+                    // give priority for an overrideImage tag from the Jenkinsfile
+                    // this also overrides the imageTag computed from the last build
+                    if (args.overrideImageTag != '' && args.overrideImageTag != null) {
+                        pipelineMap.imageTag = args.overrideImageTag
+                    }
+                    // buildImage will build with "latest" tag
+                    pipelineStep.buildImage(args.ecrRepo, args.dockerfile, args.dockerfilePath)
+                    
+                    try {
+                        // Note: If the docker image push fails , alert the user
+                        tagAndPushImageToECR(pipelineStep, args, pipelineMap.imageTag)
+                    } catch (Exception ex) {
+                        echo 'Image push to the registy has failed'
+                        echo "Exception Message: ${ex}"
+                        if (args.buildEnv != Constants.DEVBOX_STAGE) {
+                            userInputOnDockerFailure = input id: 'InputOnDockerFailure', message: 'Failure while pushing docker image to ECR ? What would you like to do ?', parameters: [choice(choices: ['Recompute the docker image id automatically'], description: '', name: 'choices')], submitterParameter: 'approvedUser'
+                            echo "User has approved ${userInputOnDockerFailure.approvedUser}"
+                            echo "The user choice is ${userInputOnDockerFailure['choices']}"
+                            exceptionDuringDockerPush = true
+                        } else {
+                            throw ex
+                        }
+                    }
+                }
+            }
+        }
+        
+        //Alert the developer that whether they wanna continue with the existing image
+        // Post exception scenario
+                if (exceptionDuringDockerPush && userInputOnDockerFailure != null) {
+                    // The control enters here if the user has not aborted the build and chose an option to recompute
+                    // the build
+                    switch (userInputOnDockerFailure['choices']) {
+                        case 'Recompute the docker image id automatically':
+                            //recompute docker Image Id
+                            boolean recomputeDockerTag = true
+                            while (recomputeDockerTag) {
+                                try {
+                                    increamentImageVersion(pipelineStep, pipelineMap)
+
+                                    tagAndPushImageToECR(pipelineStep, args, pipelineMap.imageTag)
+                                    recomputeDockerTag = false
+                                } catch (Exception ex) {
+                                    echo "Exception occured while recomputing docker image tag: ${ex}"
+                                    recomputeDockerTag = true
+                                //pipelineMap.imageTag = "1.0.525"
+                                }
+                            }
+                            break
+                        default:
+                            echo 'The user have given an invalid command input'
+                    }
+                }
+    }
+}
+
+def generateHelmForStage(def pipelineStep, Map pipelineMap, Map args, String deploymentStage) {
+    stage("Helm Generation for ${deploymentStage}") {
+        container('helm') {
+            pipelineStep.copyConfigs(args)
+            dir(args.configFilePath) {
+                sh """
+                cp -rf k8s/* .
+                mkdir ${deploymentStage}
+                """
+                pipelineStep.generateHelm(args, deploymentStage, pipelineMap.imageTag, pipelineMap.commitID, pipelineMap.md5OfMerge)
+            }
+        }
+    }
+}
+
+def tagAndPushImageToECR(def pipelineStep, Map args, String imageTag) {
+    // tag the built image with the computed Image tag
+    pipelineStep.tagImage(args.ecrRepo, imageTag)
+    // push Image
+    pipelineStep.pushImage(args.ecrRepo, imageTag)
+}
+
+def commitDeploymentFilesForTheStage(def pipelineStep, Map pipelineMap, Map args, String deploymentStage) {
+    stage("Commit ${deploymentStage} Files") {
+        container('helm') {
+            // Copy generated helm into exotel_deployments
+            sh """
+            rm -rf  exotel_deployments/${args.serviceName}/${deploymentStage}/
+            mkdir -p exotel_deployments/${args.serviceName}
+            ls ${args.configFilePath}/${deploymentStage}/*
+            mv  ${args.configFilePath}/${deploymentStage}/${args.serviceName}/templates exotel_deployments/${args.serviceName}/${deploymentStage}
+            ls -ltrh
+            mv ${args.configFilePath}/${deploymentStage}/BUILD_INFO.txt exotel_deployments/${args.serviceName}/${deploymentStage}/
+             """
+            // copy latest stable file if canary is enabled
+            if (args.enableCanary) {
+                pipelineStep.copyLatestStableFiles(args, deploymentStage)
+            }
+        }
+        sshagent(['cicd-exotel']) {
+            dir('exotel_deployments') {
+                boolean gitPushed = false
+                boolean commitPresent = false
+                //counter is to shortcircuit the loop. Try only 5 times to push git
+                //else mark the build as failure
+                int counter = 0
+                while (gitPushed == false && counter < 5) {
+                    if(pipelineMap.commitID != null && pipelineMap.md5OfMerge != null){
+                    commitPresent = pipelineStep.gitCommit(args.deploymentBranch, "Update K8s manifests for ${args.serviceName}-${deploymentStage}-${pipelineMap.imageTag}. Service Commit: ${pipelineMap.commitID.trim()}. Configs Commit: ${args.configsCommitID.trim()}", "${args.serviceName.trim()}-${pipelineMap.imageTag.trim()}-${pipelineMap.commitID.trim()}-${args.configsCommitID.trim()}-${pipelineMap.md5OfMerge.trim()}-${args.canaryColor}-rc"
+                    )
+                    echo "Files are committed and waiting to get pushed: ${commitPresent} "
+                    }
+                    if (commitPresent) {
+                        gitPushed = pipelineStep.gitPush(args.deploymentBranch)
+                        counter += 1
+                    } else {
+                        break
+                    }
+                }
+                if (gitPushed == false && commitPresent == true) {
+                    throw new Exception('Unable to push the changes to Git. Please check your repository commits/ settings')
+                }
+            }
+        }
+    }
+}
+
+def getDeploymentVersion(def pipelineStep, Map args) {
+    stage('Identify the Deployment version') {
+        def deploymentVersion = pipelineStep.getColor(args.latestStableGitTag)
+        args.canaryColor = deploymentVersion.currentColor
+        args.stableColor = deploymentVersion.lastColor
+        echo "Canary color ${args.canaryColor} and stableColor ${args.stableColor} is set"
+    }
+}
+
+def increamentImageVersion(def pipelineStep, Map pipelineMap) {
+    // increment from the lastDockerTag and assign it to the imageTag
+    // Decide based on the constant "AMENDABLE_SEMVERSION" to increment which version
+    switch (Constants.AMENDABLE_SEMVERSION) {
+            case 'minor':
+            pipelineMap.imageTag = pipelineStep.incrementSemVerMinor(pipelineMap.imageTag)
+            break
+            case 'major':
+            pipelineMap.imageTag = pipelineStep.incrementSemVerMajor(pipelineMap.imageTag)
+            break
+            default:
+                // by default increment the Patch version
+                pipelineMap.imageTag = pipelineStep.incrementSemVerPatch(pipelineMap.imageTag)
+    }
+}
+
+// Determine CQA branch based on pipeline branch (same logic as other services)
+    def determineCQABranch(Map args) {
+        // Get the pipeline branch from Jenkins environment (same as other services)
+        echo "Raw env.GIT_BRANCH: ${env.GIT_BRANCH}"
+        echo "Raw env.BRANCH_NAME: ${env.BRANCH_NAME}"
+        echo "Raw env.CHANGE_BRANCH: ${env.CHANGE_BRANCH}"
+        // Use BRANCH_NAME if GIT_BRANCH is null (common in multibranch pipelines)
+        def pipelineBranch = env.GIT_BRANCH?.replace('origin/', '')?.trim() ?: env.BRANCH_NAME
+        echo "Processed pipeline branch: ${pipelineBranch}"
+    
+    // Map pipeline branches to CQA branches
+    if (pipelineBranch == 'pu' || pipelineBranch == 'proposedupdates' || pipelineBranch == 'cqa_pu') {
+        echo "Mapped pipeline branch '${pipelineBranch}' to CQA branch 'pu'"
+        return 'pu'  // ← Integration uses pu branch
+    } else if (pipelineBranch == 'next' || pipelineBranch == 'nextrelease' || pipelineBranch == 'cqa_next') {
+        echo "Mapped pipeline branch '${pipelineBranch}' to CQA branch 'next' (now also production)"
+        return 'next'  // ← QA and Production use next branch
+    } else if (pipelineBranch == 'master' || pipelineBranch == 'cqa_master') {
+        echo "Mapped pipeline branch '${pipelineBranch}' to CQA branch 'master'"
+        return 'master'  // ← Production uses master branch
+    } else {
+        // Fallback to parameter or default
+        echo "Using fallback branch: ${args.cqaBranch ?: 'pu'} for pipeline branch: ${pipelineBranch}"
+        return args.cqaBranch ?: 'pu'
+    }
+}
+
+// clones Service repo, exotel_code and exotel_configs repo
+def cloneCodeRepos(def pipelineStep, Map pipelineMap, Map args) {
+    // Set exotelConfigBranch dynamically based on pipeline branch (override environment variable)
+    def currentPipelineBranch = env.GIT_BRANCH?.replace('origin/', '')?.trim() ?: env.BRANCH_NAME
+    def originalExotelConfigBranch = args.exotelConfigBranch
+    if (currentPipelineBranch == 'pu' || currentPipelineBranch == 'proposedupdates' || currentPipelineBranch == 'cqa_pu') {
+        args.exotelConfigBranch = 'pu'
+    } else if (currentPipelineBranch == 'next' || currentPipelineBranch == 'nextrelease' || currentPipelineBranch == 'cqa_next') {
+        args.exotelConfigBranch = 'next'
+    } else if (currentPipelineBranch == 'master' || currentPipelineBranch == 'cqa_master') {
+        args.exotelConfigBranch = 'master'
+    } else {
+        args.exotelConfigBranch = 'next'  // Default fallback
+    }
+    echo "Overriding exotelConfigBranch from '${originalExotelConfigBranch}' to '${args.exotelConfigBranch}' based on pipeline branch: ${currentPipelineBranch}"
+
+    // Clone CQA from vegaops with dynamic branch detection
+    if (args.serviceName == 'cqa') {
+        stage("Clone CQA from vegaops") {
+            pipelineStep.createDirectory('cqa-source')
+            dir('cqa-source') {
+                // Determine CQA branch based on pipeline branch (same logic as other services)
+                def cqaBranch = determineCQABranch(args)
+                echo "Cloning CQA repository from: ${Constants.CQA_VEGAOPS_URL}"
+                echo "Using branch: ${cqaBranch}"
+                echo "Pipeline branch: ${env.GIT_BRANCH}"
+                echo "DEBUG: cqaBranch = ${cqaBranch}"
+                echo "DEBUG: args.integrationBranch = ${args.integrationBranch}"
+                echo "DEBUG: args.qaBranch = ${args.qaBranch}"
+                
+                args.cqaCommitID = pipelineStep.checkoutVegaops(Constants.CQA_VEGAOPS_URL, cqaBranch)
+                // For CQA, use the Jenkins pipeline branch, not the CQA repository branch
+                def jenkinsPipelineBranch = env.GIT_BRANCH?.replace('origin/', '')?.trim() ?: env.BRANCH_NAME
+                pipelineMap.scmBranch = jenkinsPipelineBranch
+                args.serviceBranch = pipelineMap.scmBranch
+                echo "Set pipelineMap.scmBranch to Jenkins pipeline branch: ${pipelineMap.scmBranch} (CQA repo branch: ${cqaBranch})"
+                args.lastCommitId = args.cqaCommitID
+                
+                // Debug: Show what was cloned
+                echo "Repository cloned successfully. Contents:"
+                sh "ls -la"
+                echo "Current branch:"
+                sh "git branch -a"
+                echo "Recent commits:"
+                sh "git log --oneline -5"
+            }
+        }
+    } else {
+        // Keep original logic for other services
+        stage("Clone ${args.serviceName} repo") {
+            def repo = checkout scm
+            pipelineMap.scmBranch = repo.GIT_BRANCH.replace('origin/', '').trim()
+            args.serviceBranch = pipelineMap.scmBranch
+            args.lastCommitId = pipelineStep.lastcommitId()
+        }
+    }
+
+    stage('Clone Exotel_configs repo') {
+        echo "Cloning exotel_configs repository from branch: ${args.exotelConfigBranch}"
+        pipelineStep.createDirectory('exotel_configs')
+        dir('exotel_configs') {
+            //This configs commitID will be reused during helm file generation and git push
+            args.configsCommitID = pipelineStep.checkout(Constants.EXOTEL_CONFIGS_URL, args.exotelConfigBranch)
+            echo "Successfully cloned exotel_configs from branch: ${args.exotelConfigBranch}"
+            echo "Configs commit ID: ${args.configsCommitID}"
+        }
+    }
+
+    if (args.exotelCodePaths != null && args.exotelCodePaths.size() > 0) {
+        stage('Sparse checkout exotel_code') {
+            // ExotelCodePaths array should be declared in the Jenkinsfile to run this block
+            // This sparse checks out the exotelcode
+            dir('exotel_code') {
+                sh 'mkdir -p exotel_code'
+                pipelineStep.sparseCheckout(url: Constants.EXOTEL_CODE_URL, branch: args.exotelCodeBranch, checkout_paths: args.exotelCodePaths)
+            }
+        }
+    }
+}
+
+// Clones exotel deployments repo and gets latestStableGitTag if canary deployment is enabled
+def cloneExotelDeploymentsRepo(def pipelineStep, Map args) {
+    
+    if(!args.deploymentRepo || args.deploymentRepo == '') {
+      //If there are no parameters passed
+        if(!args.deployRepo || args.deployRepo == '') {
+            args.deployRepo = args.integrationBranch
+        }
+
+        if(args.deployRepo != "pu" && args.deployRepo != "proposedupdates" && args.deployRepo != "next" && args.deployRepo != "nextrelease"   ) {
+        args.deploymentRepo = Constants.FEATURE_DEPLOYMENT_REPO
+        }
+        else {
+            args.deploymentRepo = Constants.DEPLOYMENT_REPO
+        }
+        
+    }
+    if (!args.deploymentBranch || args.deploymentBranch == '') {
+        args.deploymentBranch = Constants.DEPLOYMENT_BRANCH
+    }
+   
+    stage('Clone Exotel_deployments repo') {
+        pipelineStep.createDirectory('exotel_deployments')
+        dir('exotel_deployments') {
+            url = Constants.REPO_BASE_URL + '/' + args.deploymentRepo + '.git'
+            print url
+            branch = args.deploymentBranch
+            pipelineStep.checkout(url, branch)
+        }
+    }
+
+    stage('Clone last stable deployment files') {
+        // canary is enabled in Jenkinsfile.
+        // Now, checkout exotel_deployments with the last stable commit
+        if (args.enableCanary) {
+            sh '''
+                        cp -rf exotel_deployments exotel_deployments_stable
+                    '''
+            dir('exotel_deployments_stable') {
+                String latestStableGitTag = pipelineStep.searchStableGitTag(args.serviceName)
+                String commitIDOfLatestStableTag = pipelineStep.findCommitIDOfATag(latestStableGitTag)
+                sh """
+                            git reset --hard ${commitIDOfLatestStableTag}
+                        """
+                args['latestStableGitTag'] = latestStableGitTag
+            }
+        }
+    }
+}
+
+def lintDockerfile(Map args) {
+    stage('Lint Dockerfile') {
+        //Lint Dockerfile
+        if (args.dockerfilePath?.trim()) {
+            container('builder') {
+                // For CQA applications, Dockerfile is in cqa-source directory
+                if (args.serviceName == 'cqa') {
+                    dir('cqa-source') {
+                        // Debug: List all files in cqa-source directory
+                        sh "echo 'Files in cqa-source directory:' && ls -la"
+                        sh "echo 'Looking for Dockerfile: ${args.dockerfile}'"
+                        
+                        // Check if Dockerfile exists before linting
+                        if (fileExists("${args.dockerfile}")) {
+                            echo "Dockerfile found! Running Hadolint linting..."
+                            def lintResult = sh(script: "nerdctl run --rm -i hadolint/hadolint < ${args.dockerfile}", returnStdout: true)
+                        } else {
+                            echo "Dockerfile not found in cqa-source directory. Skipping Dockerfile linting."
+                            echo "Please ensure Dockerfile exists in the CQA repository for linting to work."
+                            echo "Current directory contents:"
+                            sh "ls -la"
+                        }
+                    }
+                } else {
+                    // For other services, use the specified dockerfilePath
+                    dir(args.dockerfilePath) {
+                        def lintResult = sh(script: "nerdctl run --rm -i hadolint/hadolint < ${args.dockerfile}", returnStdout: true)
+                    }
+                }
+            }
+        } else {
+            throw new Exception('Invalid Dockerfile Path Passed.')
+        }
+    }
+}
+
+def buildJars(Map args) {
+    stage('Build Jar files') {
+        container('jdk') {
+            // Build Maven command dynamically
+            def mavenCmd = "mvn ${args.mavenGoals ?: 'clean package'}"
+            
+            // Add skip tests if specified
+            if (args.skipTests == 'true') {
+                mavenCmd += " -DskipTests"
+            }
+            
+            // Add profiles if specified
+            if (args.mavenProfiles) {
+                mavenCmd += " -P${args.mavenProfiles}"
+            }
+            
+            // Add exotel_code_base parameter as system property
+            mavenCmd += " -Dexotel_code_base=exotel_code/"
+            
+            // For CQA applications, run Maven from cqa-source directory
+            if (args.serviceName == 'cqa') {
+                dir('cqa-source') {
+                    // Set MAVEN_OPTS for JVM options
+                    if (args.mavenOptions) {
+                        env.MAVEN_OPTS = args.mavenOptions
+                    }
+                    sh """
+                        echo "Executing Maven command in cqa-source directory: ${mavenCmd}"
+                        echo "MAVEN_OPTS: ${env.MAVEN_OPTS ?: 'Not set'}"
+                        ${mavenCmd}
+                    """
+                }
+            } else {
+                // For other services, run Maven from current directory
+                // Set MAVEN_OPTS for JVM options
+                if (args.mavenOptions) {
+                    env.MAVEN_OPTS = args.mavenOptions
+                }
+                sh """
+                    echo "Executing Maven command: ${mavenCmd}"
+                    echo "MAVEN_OPTS: ${env.MAVEN_OPTS ?: 'Not set'}"
+                    ${mavenCmd}
+                """
+            }
+        }
+    }
+}
+
+// this is step is for devbox build
+def pushHelmChartsToS3(Map args) {
+    stage('Pushing the files to s3')
+    bucketName = 'exotel-dev-box2'
+    folder = '/${args.serviceName}/${args.serviceBranch}/'.toString()
+    container('helm') {
+        // Copy generated helm into exotel_deployments
+        // Aws secrets need to be read from secret manager and the whole aws cli setup should be included in build agent image
+        sh """
+            rm -rf  ${args.serviceName}/devbox/
+            mkdir -p ${args.serviceName}
+            ls ${args.configFilePath}/devbox/*
+            mv  ${args.configFilePath}/devbox/${args.serviceName}/templates ${args.serviceName}/devbox
+            mv ${args.configFilePath}/devbox/BUILD_INFO.txt ${args.serviceName}/devbox/
+            ls ${args.serviceName}/devbox/
+            tar -zcvf ${args.serviceName}.devbox.tar.gz ${args.serviceName}/devbox
+            echo "printing files"
+            ls -ltrh
+            pwd
+            cp ${args.serviceName}.devbox.tar.gz /tmp
+            cd /tmp
+            ls -ltrh
+            pwd
+            echo "Am in /tmp folder"
+            apk update; apk add curl
+            curl "https://s3.amazonaws.com/aws-cli/awscli-bundle.zip" -o "awscli-bundle.zip"
+            apk add --update --no-cache python3 && ln -sf python3 /usr/bin/python
+            python3 -m ensurepip
+            pip3 install --no-cache --upgrade pip setuptools
+            unzip awscli-bundle.zip
+            ./awscli-bundle/install -b ~/bin/aws
+            /root/bin/aws --version
+            /root/bin/aws configure set aws_access_key_id 
+            /root/bin/aws configure set aws_secret_access_key 
+            /root/bin/aws configure set default.region us-west-2
+            /root/bin/aws s3 cp ${args.serviceName}.devbox.tar.gz s3://${args.bucketName}/${args.serviceName}/${args.serviceBranch}/
+        """
+    }
+}
+return this
+
+---
+
+# /Users/shashidhara.reddy/jenkins-pipeline/src/com/exotel/Constants.groovy
+
+package com.exotel
+
+class Constants {
+
+   static final String GIT_CREDENTIAL_KEY = 'cicd-exotel'
+   static final String VEGAOPS_CREDENTIAL_KEY = 'vegaops-pat-token'
+   static final String EXOTEL_CONFIGS_URL = 'git@bitbucket.org:Exotel/exotel_configs.git'
+   static final String EXOTEL_DEPLOYMENT_URL = 'git@bitbucket.org:Exotel/exotel_deployments.git'
+   static final String EXOTEL_CODE_URL = 'git@bitbucket.org:Exotel/exotel_code.git'
+   static final String CQA_VEGAOPS_URL = 'https://exotel.vegaops.com:64998/ameyo_cloud_stack/cqa.git'
+   static final String REPO_BASE_URL = 'git@bitbucket.org:Exotel'
+   static final String DEPLOYMENT_REPO = 'exotel_deployments'
+   static final String FEATURE_DEPLOYMENT_REPO = 'devprod_deployments'
+   static final String DEPLOYMENT_BRANCH = 'master'
+   static final String EXOTEL_DEPLOYMENT_BRANCH = 'master'
+   static final String AMENDABLE_SEMVERSION = 'patch'
+   static final String AWS_ID = '350027074327'
+   static final String ECR_REGION = 'ap-southeast-1'
+   static final String INTEGRATION_STAGE = 'integration'
+   static final String PROD_STAGE = 'prod'
+   static final String MUM1_STAGE = 'mum1'
+   static final String DEVBOX_STAGE = 'devbox'
+   // this repo is used for devbox images, and it's one repo for all the services
+   static final String BRANCH_BUILD_ECR_REPO = '350027074327.dkr.ecr.ap-southeast-1.amazonaws.com/devboxbuild'
+   static final String BRANCH_BUILD_S3_BUCKET = 'exotel-dev-box2'
+}
+
+---
+
+# /Users/shashidhara.reddy/jenkins-pipeline/src/com/exotel/DevboxWorkFlow.groovy
+
+package com.exotel
+
+import com.exotel.Constants
+
+import groovy.json.internal.Exceptions
+import org.codehaus.groovy.control.messages.ExceptionMessage
+
+import org.jets3t.service.impl.rest.httpclient.RestS3Service
+import org.jets3t.service.model.S3Bucket
+import org.jets3t.service.model.S3Object
+import org.jets3t.service.impl.rest.httpclient.RestS3Service
+import org.jets3t.service.security.AWSCredentials
+import groovy.io.FileType
+@Grab('net.java.dev.jets3t:jets3t:0.9.4')
+
+def pipelineStep
+def repo = checkout scm
+def commonWorkflowStep
+
+// Steps to be followed in Integration Pipeline
+// Find the dockerfile and build the image and push to devbox/service repo
+// Create helm charts and push to s3
+def Init(Map args) {
+    def pipelineMap = [:]
+    pipelineStep = new JenkinsPipelineSteps()
+    commonWorkflowStep = new CommonWorkflowSteps()
+    // Use "<serviceName>-<serviceBranch>-<commit>-1.0" as image tag
+    pipelineStep.generateDevboxImageTag(pipelineMap, args)
+    args.ecrRepo = Constants.BRANCH_BUILD_ECR_REPO
+    args.overrideImageTag = ''
+    commonWorkflowStep.buildAndPushDockerImage(pipelineStep, pipelineMap, args)
+
+    args.canaryColor = 'blue'
+    args.stableColor = 'blue'
+    pipelineMap.commitID = args.lastCommitId
+    pipelineMap.md5OfMerge = ''
+    commonWorkflowStep.generateHelmForStage(pipelineStep, pipelineMap, args, Constants.DEVBOX_STAGE)
+
+    args.bucketName = Constants.BRANCH_BUILD_S3_BUCKET
+    commonWorkflowStep.pushHelmChartsToS3(args)
+    pipelineStep.printBuildInfo(pipelineMap, args)
+}
+
+return this;
+
+---
+
+# /Users/shashidhara.reddy/jenkins-pipeline/src/com/exotel/InfraWorkflow.groovy
+
+package com.exotel
+
+import com.exotel.Constants
+import io.estrado.components.Common
+
+void AnsibleDeploy(Map args) {
+    pipelineStep = new JenkinsPipelineSteps()
+    def label = pipelineStep.getWorkerLabel(args.serviceName)
+    def imageName = args.containerImage ?: 'exotelorg/ansible:2.5.3'
+
+    println('Initializing ansible playbook execution')
+
+    podTemplate(label: label, namespace: 'infra', serviceAccount: 'jenkins', containers: [
+        containerTemplate(name: 'ansible', image: imageName, command: 'cat', ttyEnabled: true)
+    ], imagePullSecrets: ['exotelorg-dockerhub-secret'], volumes: [
+                    hostPathVolume(mountPath: '/run/containerd', hostPath: '/run/containerd'),
+                    hostPathVolume(mountPath: '/var/lib/containerd', hostPath: '/var/lib/containerd'),
+                    hostPathVolume(mountPath: '/var/lib/nerdctl', hostPath: '/var/lib/nerdctl'),
+                    hostPathVolume(mountPath: '/opt/cni/bin', hostPath: '/opt/cni/bin'),
+                    hostPathVolume(mountPath: '/etc/cni/net.d', hostPath: '/etc/cni/net.d'),
+                    volumeMounts: [mountPath '/root/.dockerhubsecret', name: 'dockerhub-creds'],
+    ]) {
+        node(label) {
+            stage('Code Checkout') {
+                dir('exotel_code') {
+                    sh 'mkdir -p exotel_code'
+                    pipelineStep.initialize()
+                    pipelineStep.sparseCheckout(url: Constants.EXOTEL_CODE_URL, branch: args.exotelCodeBranch, checkout_paths: args.exotelCodePaths)
+                }
+            }
+
+            stage('Playbook Execution') {
+                container('ansible') {
+                    // Prepare the environment variables as command-line arguments
+                    def envArgs = args.extraVars.collect { "-e ${it.key}=${it.value}" }.join(' ')
+
+                    def ansibleCommand = "ansible-playbook -i ${args.hosts}, ${args.playbookFilename} -f ${args.fork} ${envArgs}"
+
+                    // Retrieve the SSH private key only if it is defined and pass to ansible command
+                    def keyName = args.containsKey('private_key_credential_id') ? args.private_key_credential_id : null
+                    if (keyName) {
+                        withCredentials([sshUserPrivateKey(credentialsId: keyName, keyFileVariable: 'KEY_FILE_VARIABLE')]) {
+                            ansibleCommand += " --private-key=\${KEY_FILE_VARIABLE}"
+                            sh "cd ${WORKSPACE}/${args.workspacePath} && ${ansibleCommand}"
+                        }
+                    } 
+                    else {
+                        sh "cd ${WORKSPACE}/${args.workspacePath} && ${ansibleCommand}"
+                    }
+
+                }
+            }
+        }
+    }
+}
+
+
+void AnsibleBuild(Map args) {
+    pipelineStep = new JenkinsPipelineSteps()
+    def label = pipelineStep.getWorkerLabel(args.serviceName)
+    String commitId
+
+    println('Initializing ansible build process')
+
+    podTemplate(label: label, namespace: 'infra', serviceAccount: 'jenkins', containers: [
+        containerTemplate(name: 'ansible-build', image: "bitnami/aws-cli:2", command: 'cat', ttyEnabled: true, runAsUser: '0')
+    ], imagePullSecrets: ['exotelorg-dockerhub-secret'], volumes: [
+        hostPathVolume(mountPath: '/run/containerd', hostPath: '/run/containerd'),
+        hostPathVolume(mountPath: '/var/lib/containerd', hostPath: '/var/lib/containerd'),
+        hostPathVolume(mountPath: '/var/lib/nerdctl', hostPath: '/var/lib/nerdctl'),
+        hostPathVolume(mountPath: '/opt/cni/bin', hostPath: '/opt/cni/bin'),
+        hostPathVolume(mountPath: '/etc/cni/net.d', hostPath: '/etc/cni/net.d'),
+        volumeMounts: [mountPath: '/root/.dockerhubsecret', name: 'dockerhub-creds'],
+    ]) {
+        node(label) {
+            stage('Code Checkout') {
+                dir('exotel_code') {
+                    sh 'mkdir -p exotel_code'
+                    pipelineStep.initialize()
+                    pipelineStep.sparseCheckout(url: Constants.EXOTEL_CODE_URL, branch: args.exotelCodeBranch, checkout_paths: args.exotelCodePaths)
+                    commitId = pipelineStep.getCommitId()
+                }
+            }
+
+            stage('Build') {
+                container('ansible-build') {
+                    sh """
+                        #!/bin/bash
+
+                        cd ${env.WORKSPACE}
+                        S3_BUCKET="s3://exotel-build/${args.artifact}/${args.env}/${args.serviceName}"
+                        
+                        if aws s3 ls \${S3_BUCKET}/latest.txt; then
+                            aws s3 cp \${S3_BUCKET}/latest.txt RELEASE
+                            VERSION=\$(( `grep VERSION RELEASE | cut -d'=' -f2` + 1 ))
+                        else
+                            VERSION=1
+                        fi
+
+                        CURRENT_TIME=\$(TZ=Asia/Kolkata date +'%Y-%m-%d-%H-%M-%SIST')
+
+                        echo "MODULE=${args.artifact}\nVERSION=\${VERSION}\nBUILD=${env.BUILD_NUMBER}\nGIT_COMMIT=${commitId}\nTIMESTAMP=\${CURRENT_TIME}" > RELEASE
+
+                        rm -rf ${env.WORKSPACE}/${args.artifact}.tar
+                        cd ${env.WORKSPACE}/exotel_code/getafix/trunk
+                        cp ../../../RELEASE ansible/
+                        tar --exclude="*/.git" -cf ../../../${args.artifact}.tar ansible
+                        aws s3 cp ../../../${args.artifact}.tar \${S3_BUCKET}/${args.artifact}-\${VERSION}.tar --storage-class REDUCED_REDUNDANCY --sse AES256
+                        aws s3 cp ${env.WORKSPACE}/RELEASE \${S3_BUCKET}/latest.txt
+                    """
+                }
+            }
+        }
+    }
+}
+
+
+void TerraformDeploy(Map args) {
+    pipelineStep = new JenkinsPipelineSteps()
+    Common common = new Common()
+
+    def label = pipelineStep.getWorkerLabel(args.serviceName)
+    
+    // Check if container image is passed, else use the default image
+    def imageName = args.containerImage ?: 'exotelorg/terraform:1.1.6'
+    
+    // Extract name of repository
+    def repoName = args.workspacePath.split('/')[0]
+
+    // Define the Terraform command to run
+    def terraformCommand = "cd ${args.workspacePath} && terraform"
+
+    // Options to be passed to Terraform commands
+    def backendConfig = args.backendConfig ?: null
+    def varFile = args.varFile ?: null
+
+    println('Initializing Terraform script execution')
+
+    podTemplate(label: label, namespace: 'infra', serviceAccount: 'jenkins', containers: [
+        containerTemplate(name: 'terraform', image: imageName, command: 'cat', ttyEnabled: true)
+    ], imagePullSecrets: ['exotelorg-dockerhub-secret'], volumes: [
+        hostPathVolume(mountPath: '/run/containerd', hostPath: '/run/containerd'),
+        hostPathVolume(mountPath: '/var/lib/containerd', hostPath: '/var/lib/containerd'),
+        hostPathVolume(mountPath: '/var/lib/nerdctl', hostPath: '/var/lib/nerdctl'),
+        hostPathVolume(mountPath: '/opt/cni/bin', hostPath: '/opt/cni/bin'),
+        hostPathVolume(mountPath: '/etc/cni/net.d', hostPath: '/etc/cni/net.d'),
+        volumeMounts: [mountPath: '/root/.dockerhubsecret', name: 'dockerhub-creds'],
+    ]) {
+        node(label) {
+            // Checkout source code
+            stage('Code Checkout') {
+                dir(repoName) {
+                    sh "mkdir -p ${repoName}"
+                    pipelineStep.initialize()
+                    pipelineStep.sparseCheckout(url: args.exotelCloudResourceUrl, branch: args.exotelCloudResourceBranch, checkout_paths: args.exotelCloudResourcePaths)
+                }
+            }
+
+            // Initialize Terraform 
+            stage('Terraform Initialization') {
+                container('terraform') {
+                    // Configure Terraform backend if backendConfig is present
+                    if (backendConfig != null) {
+                        stage('Configure Remote Backend') {
+                            sh "${terraformCommand} init -no-color -backend-config=${backendConfig}"
+                        }
+                    } else {
+                        stage('Initialize Local Backend') {
+                            sh "${terraformCommand} init -no-color"
+                        }
+                    }
+                }
+            }
+
+            // Generate Terraform plan
+            stage('Terraform Plan') {
+                container('terraform') {
+                    def cmd = "${terraformCommand} plan -no-color -out=tfplan"
+
+                    // Use the variable file if passed in `args`
+                    if (varFile) {
+                        cmd += "-var-file=${varFile}"
+                    }
+                    sh cmd
+                    sh "${terraformCommand} show -no-color tfplan > tfplan.txt"
+                }
+            }
+
+            // Approval step for Terraform plan
+            stage('Approval') {
+                container('terraform') {
+                    def plan = readFile "${args.workspacePath}/tfplan.txt"
+
+                    timeout(activity: true, time: 5, unit: "DAYS") {
+                        input message: "Do you want to apply the plan?",
+                                         parameters: [text(name: 'Plan', description: 'Please review the plan', defaultValue: plan)],
+                                         ok: 'Approve', id: 'UserInput', 
+                                         submitter: "${args.allowedApprovers}", submitterParameter: 'APPROVAL'
+                    }
+                }
+            }
+
+            // Run Terraform apply if approved
+            stage('Terraform Apply') {
+                container('terraform') {
+                    def cmd = "${terraformCommand} apply -auto-approve tfplan -no-color"
+
+                    // Use the variable file if passed in `args`
+                    if (varFile) {
+                        cmd += "-var-file=${varFile}"
+                    }
+                    sh cmd
+                }
+            }
+
+            // Commit the state file if remote backend is not configured
+            stage('Commit State File') {
+
+                if (backendConfig == null) {
+
+                    // Extract name of repository and workspace path
+                    // def tfStateRepoName = args.tfStateArtifactoryUrl.split('/')[1].split('\\.')[0]
+                    // def parentDirs = args.workspacePath.split('/').drop(1).join('/')
+
+                    dir("${args.workspacePath}") {
+                        
+                        // Checkout repository that is used to store the state files
+                        // pipelineStep.sparseCheckout(url: args.tfStateArtifactoryUrl, branch: args.tfStateArtifactoryBranch, checkout_paths: "")
+
+                        // Create parent directories if they don't exist
+                        // sh "mkdir -p ${parentDirs}"
+
+                        // Copy the state file
+                        // sh "cp ../${args.workspacePath}/terraform.tfstate ${parentDirs}/"
+
+                        // Remove unnecessary files
+                        sh "rm tfplan tfplan.txt"
+
+                        // Commit and push the state file to repo
+                        sshagent(['cicd-exotel']) {
+                            common.gitPush(
+                                branch: "${args.exotelCloudResourceBranch}",
+                                commit_msg: "Commit Terraform state file - Build #${env.BUILD_NUMBER}"
+                            )
+                        }
+                    }
+                } else {
+                    echo "Remote backend is configured. Skipping state file commit."
+                }
+            }
+        }
+    }
+}
+
+---
+
+# /Users/shashidhara.reddy/jenkins-pipeline/src/com/exotel/IntegrationWorkflow.groovy
+
+package com.exotel
+
+import com.exotel.Constants
+
+import groovy.json.internal.Exceptions
+import org.codehaus.groovy.control.messages.ExceptionMessage
+
+import org.jets3t.service.impl.rest.httpclient.RestS3Service
+import org.jets3t.service.model.S3Bucket
+import org.jets3t.service.model.S3Object
+import org.jets3t.service.impl.rest.httpclient.RestS3Service
+import org.jets3t.service.security.AWSCredentials
+import groovy.io.FileType
+@Grab('net.java.dev.jets3t:jets3t:0.9.4')
+
+//import org.apache.tools.ant.taskdefs.optional.junit.Constants;
+
+//declare pipelineStep
+def pipelineStep;
+
+def Init(Map args) {
+    // Steps to be followed in Integration Pipeline //
+    // Find the dockerfile
+    // Find the commit id
+    // Check if the commit has a docker image attached to it . if yes , dont build image else build
+    // Push the built image
+    // Override tag . Alert if there was override failure
+    // Create helm charts for integration setup
+    print "executing integration work flow"
+    def pipelineMap = [:]
+    pipelineStep = new JenkinsPipelineSteps();
+    CommonWorkflowSteps commonWorkflowStep = new CommonWorkflowSteps()
+    if(args.integrationBranch == 'pu' || args.integrationBranch == 'proposedupdates') {
+        commonWorkflowStep.computeGitCommits(pipelineStep, pipelineMap, args)
+    }
+    commonWorkflowStep.imageBuildPreChecks(pipelineStep, pipelineMap, args)
+
+    if (pipelineMap.shouldBuildDockerImage) {
+        commonWorkflowStep.increamentImageVersion(pipelineStep, pipelineMap)
+        commonWorkflowStep.buildAndPushDockerImage(pipelineStep, pipelineMap, args)
+    }
+
+    commonWorkflowStep.getDeploymentVersion(pipelineStep, args)
+
+    if (args.enableCanary) {
+        pipelineStep.copyLatestStableFiles(args, args.integrationStage)
+    }
+
+    commonWorkflowStep.generateHelmForStage(pipelineStep, pipelineMap, args, args.integrationStage)
+    commonWorkflowStep.commitDeploymentFilesForTheStage(pipelineStep, pipelineMap, args, args.integrationStage)
+    pipelineStep.printBuildInfo(pipelineMap, args)
+}
+
+return this;
+
+---
+
+# /Users/shashidhara.reddy/jenkins-pipeline/src/com/exotel/JenkinsPipelineBuilder.groovy
+
+package com.exotel
+
+import com.exotel.Constants
+import org.codehaus.groovy.control.messages.ExceptionMessage
+
+// Declare pipelineStep
+def pipelineStep
+// Declare integrationWorkflow
+def integrationWF
+// Declare qaWorkflow
+def qaWF
+// Declare productionWorkflow
+def prodWF
+// Declare masterWorkflow
+def masterWF
+// Approver
+def approver
+// Declare deployment stages
+def deploymentStage
+
+void createBuilder(Map args) {
+    println('Initializing PipelineBuilder')
+    CommonWorkflowSteps commonWorkflowStep = new CommonWorkflowSteps()
+    pipelineStep = new JenkinsPipelineSteps()
+    pipelineStep.readEnvironmentVariable(args)
+    def pipelineMap = [: ]
+    integrationWF = new IntegrationWorkflow()
+    devboxWF = new DevboxWorkFlow()
+    qaWF = new QAWorkflow()
+    prodWF = new ProdWorkflow()
+    masterWF = new MasterWorkflow()
+
+    def label = pipelineStep.getWorkerLabel(args.serviceName)
+
+    // setting default values
+    args.integrationStage = args.integrationStage ? args.integrationStage : Constants.INTEGRATION_STAGE
+    args.exotelCodeBranch = args.exotelCodeBranch ? args.exotelCodeBranch : 'master'
+    args.integrationBranch = args.integrationBranch ? args.integrationBranch : 'proposedupdates'
+    args.qaBranch = args.qaBranch ? args.qaBranch : 'nextrelease'
+
+    // Declare POD template definition
+    podTemplate(label: label, namespace: 'infra', serviceAccount: 'jenkins', containers: [
+        containerTemplate(name: 'builder', 
+                        image: 'exotelorg/nerdctl-awscli:v1', 
+                        command: '/bin/sh -c', 
+                        args: 'buildkitd --rootless & sleep 2 && cat', 
+                        ttyEnabled: true, 
+                        privileged: true,
+                        volumeMounts: [mountPath: '/root/.dockerhubsecret', name: 'dockerhub-creds']),
+        containerTemplate(name: 'helm', image: 'exotelorg/k8s-helm', command: 'cat', ttyEnabled: true)
+    ], imagePullSecrets: ['exotelorg-dockerhub-secret'], volumes: [
+        hostPathVolume(mountPath: '/run/containerd', hostPath: '/run/containerd'),
+        hostPathVolume(mountPath: '/var/lib/containerd', hostPath: '/var/lib/containerd'),
+        hostPathVolume(mountPath: '/var/lib/nerdctl', hostPath: '/var/lib/nerdctl'),
+        hostPathVolume(mountPath: '/opt/cni/bin', hostPath: '/opt/cni/bin'),
+        hostPathVolume(mountPath: '/etc/cni/net.d', hostPath: '/etc/cni/net.d'),
+        secretVolume(secretName: 'exotelorg-dockerhub-secret', mountPath: '/root/.dockerhubsecret', name: 'dockerhub-creds'),
+    ]) {
+        node(label) {
+            // Sets git configs
+            pipelineStep.initialize()
+            commonWorkflowStep.cloneCodeRepos(pipelineStep, pipelineMap, args)
+
+            // No need to checkout exotel_deployment repo for devbox build since deployment ymls are pushed to s3 files are
+            if (args.buildEnv != Constants.DEVBOX_STAGE) {
+                commonWorkflowStep.cloneExotelDeploymentsRepo(pipelineStep, args)
+            }
+            
+            // Pick the workflow to run based on build environment
+            if (args.buildEnv == Constants.DEVBOX_STAGE) {
+                devboxWF.Init(args)
+            } else if (pipelineMap.scmBranch == args.integrationBranch) {
+                integrationWF.Init(args)
+            } else if (pipelineMap.scmBranch == 'master') {
+                masterWF.Init(args)
+            } else if (pipelineMap.scmBranch == args.qaBranch) {
+                //Run approaval for PROD
+                println args.qaApprovers
+                timeout(activity: true, time: 5, unit: 'DAYS') {
+                    approver = input id: 'UserInput', message: 'Promote to Production Environments ?', ok: 'Approve', submitter: "${args.qaApprovers}", submitterParameter: 'APPROVAL'
+                }
+                def assignedApprovers = args.qaApprovers.split(',')
+                echo "Assigned approvers are ${args.qaApprovers} . Approved person is ${approver}"
+
+                if (assignedApprovers.contains(approver)) {
+                    podTemplate(label: label, namespace: 'infra', serviceAccount: 'jenkins', containers: [
+                        containerTemplate(name: 'builder', 
+                        image: 'exotelorg/nerdctl-awscli:v1', 
+                        command: '/bin/sh -c', 
+                        args: 'buildkitd --rootless & sleep 2 && cat', 
+                        ttyEnabled: true, 
+                        privileged: true,
+                        volumeMounts: [mountPath: '/root/.dockerhubsecret', name: 'dockerhub-creds']),
+                        containerTemplate(name: 'helm', image: 'exotelorg/k8s-helm', command: 'cat', ttyEnabled: true)
+                    ], imagePullSecrets: ['exotelorg-dockerhub-secret'], volumes: [
+                        hostPathVolume(mountPath: '/run/containerd', hostPath: '/run/containerd'),
+                        hostPathVolume(mountPath: '/var/lib/containerd', hostPath: '/var/lib/containerd'),
+                        hostPathVolume(mountPath: '/var/lib/nerdctl', hostPath: '/var/lib/nerdctl'),
+                        hostPathVolume(mountPath: '/opt/cni/bin', hostPath: '/opt/cni/bin'),
+                        hostPathVolume(mountPath: '/etc/cni/net.d', hostPath: '/etc/cni/net.d'),
+                        secretVolume(secretName: 'exotelorg-dockerhub-secret', mountPath: '/root/.dockerhubsecret', name: 'dockerhub-creds')
+                    ]) {
+                        node(label) {
+                            pipelineStep.initialize()
+                            commonWorkflowStep.cloneCodeRepos(pipelineStep, pipelineMap, args)
+                            commonWorkflowStep.cloneExotelDeploymentsRepo(pipelineStep, args)
+                            prodWF.Init(args)
+                        }
+                    }
+                } else {
+                    echo 'You are not supposed to approve this build'
+                }
+            } else {
+                echo "unimplemented branch workflow"
+            }
+        }
+    }
+}
+
+return this
+
+---
+
+# /Users/shashidhara.reddy/jenkins-pipeline/src/com/exotel/JenkinsPipelineSteps.groovy
+
+package com.exotel
+
+import com.exotel.Constants
+import org.codehaus.groovy.control.messages.ExceptionMessage
+
+import java.security.MessageDigest
+
+//initializes the pipeline
+void initialize() {
+    echo 'Initializing Pipeline steps. '
+    echo 'Setting git credentials'
+    sh 'git config --global user.name cicd-exotel'
+    sh 'git config --global user.email cicd@exotel.in'
+}
+
+//cleans the workspace
+void cleanDirectory() {
+    echo 'Cleaning workspace'
+    deleteDir()
+}
+
+void createDirectory(String name) {
+    echo 'Creating directory ' + name
+    sh "mkdir -p ${name}"
+}
+
+String readFile(String fileName) {
+    String contents = new File(fileName).getText('utf-8')
+    return contents
+}
+
+/* ******************************************************************* Git related functions ********************* */
+//checkout clones the scm repo
+String checkout(String url, String branch) {
+    def result = checkout([$class: 'GitSCM', branches: [[name: '*/' + branch]], doGenerateSubmoduleConfigurations: false, extensions: [[$class: 'CloneOption', honorRefspec: true, noTags: false, reference: '', shallow: false, timeout: 10]], submoduleCfg: [], userRemoteConfigs: [[credentialsId: Constants.GIT_CREDENTIAL_KEY, url: url]]])
+    // first 7 chars of a commit id makes it unique
+    return result.GIT_COMMIT.trim().substring(0, 7)
+}
+
+// sparse checkouts to checkout only specific folders of the repo
+def sparseCheckout(Map checkoutMap) {
+    def sparseCheckout_paths = []
+    for (item in checkoutMap.checkout_paths) {
+        sparseCheckout_paths.add([path : item])
+    }
+    println("sparseCheckoutPaths: ${sparseCheckout_paths}")
+    def result = checkout([$class: 'GitSCM', branches: [[name: checkoutMap.branch]], doGenerateSubmoduleConfigurations: false, extensions: [[$class: 'SparseCheckoutPaths', sparseCheckoutPaths: sparseCheckout_paths], [$class: 'CheckoutOption', timeout: 10], [$class: 'CloneOption', depth: 1, noTags: false, reference: '', shallow: true, timeout: 10]], submoduleCfg: [], userRemoteConfigs: [[credentialsId: Constants.GIT_CREDENTIAL_KEY, url: checkoutMap.url]]])
+}
+
+//checkout clones the vegaops repo using vegaops credentials
+String checkoutVegaops(String url, String branch) {
+    def result = checkout([$class: 'GitSCM', branches: [[name: '*/' + branch]], doGenerateSubmoduleConfigurations: false, extensions: [[$class: 'CloneOption', honorRefspec: true, noTags: false, reference: '', shallow: false, timeout: 10]], submoduleCfg: [], userRemoteConfigs: [[credentialsId: Constants.VEGAOPS_CREDENTIAL_KEY, url: url]]])
+    // first 7 chars of a commit id makes it unique
+    return result.GIT_COMMIT.trim().substring(0, 7)
+}
+
+// gets the current build branch of scm repo
+String getBranch() {
+    String branchName
+    sh "git show-ref | grep `git rev-parse HEAD` | grep remotes | grep -v HEAD | sed -e 's/.*remotes.origin.//' > branch.txt"
+    branchName = readFile('branch.txt').trim()
+    echo 'Building Branch ' + branchName
+    return branchName
+}
+
+// gets the commit id
+String getCommitId() {
+    String commitId = sh(returnStdout: true, script: 'git rev-parse HEAD').trim()
+    return commitId
+}
+
+String getMergedBranch(String mergeCommitID) {
+    String branchName = sh(returnStdout: true, script: "git show-branch ${mergeCommitID} | awk '{print \$4}'")
+    echo "Merged Branch name is ${branchName}"
+    return branchName
+}
+
+//checks if current commit is a merge commit and responds with a boolean
+boolean checkMergeCommit(String commitID) {
+    //this returns 0 if it is a merge commit. 1 if it is not a merge commit
+    String checkMerge = sh(returnStdout: true, script: "git show --summary ${commitID} | grep -q  ^Merge: ; echo \$?")
+    echo "Result of checkMergeCommit is ${checkMerge}"
+    if (checkMerge.trim() == '0') {
+        return true
+    }else {
+        return false
+    }
+}
+
+//returns boolean if there is a diff between master and current branch
+boolean findDiffWithMaster(String branch) {
+    if (branch == 'master') {
+        return true
+    }
+    String diffLines = sh(returnStdout: true, script: "git diff ${branch}..master | wc -l")
+    if (diffLines.trim() == '0') {
+        return false
+    }
+    //there exist a diff. Hence run the complete pipeline
+    return true
+}
+
+// finds the common ancestor of two git branches
+// gives the latest commit id between two branches
+String getMergeBase(String firstBranch, String secondBranch) {
+    String commitId = sh(returnStdout: true, script: "git merge-base ${firstBranch} ${secondBranch}")
+    echo "Merge base between ${firstBranch} and ${secondBranch} is ${commitId}"
+    return commitId
+}
+
+// gets the first commit id under a merge commit
+String getFirstSubcommitOfaMerge(String mergeCommitId) {
+    String subCommit = sh(returnStdout: true, script: 'git rev-list HEAD | sed -n 2p')
+    echo "Subcommit under the Merge commit is ${subCommit}"
+    return subCommit.trim().substring(0, 7)
+}
+
+// returns the last commit
+String lastcommitId() {
+    String lastCommitId = sh(returnStdout: true, script: 'git rev-list HEAD | sed -n 1p')
+    echo "Last commit Id is ${lastCommitId}"
+    return lastCommitId.trim().substring(0, 7)
+}
+
+// Takes commit ID as an input and returns the top 1 git tag where the tag name contains the commitID and the name
+String searchGitTag(String commitID, String name) {
+    if (commitID != '*' && commitID != null) {
+        commitID = commitID.trim().substring(0, 7)
+    }
+    print('Searching for git tag in exotel_deployments with CommitId :' + commitID + ' and service name : ' + name)
+    String tag = sh(returnStdout: true, script: "git tag  --sort=-creatordate -l \"${name}-*${commitID}*-rc\" | head -n 1 ")
+    if (tag == '' || tag == null) {
+        echo "A git tag ${tag} does not exist for the keyword ${commitID} and the service ${name}"
+    }
+    print('Found git tag : ' + tag)
+    return tag
+}
+
+// Takes commit ID as an input and returns the top 1 git tag where the tag name contains the commitID and the name and the keyword production
+String searchProductionGitTag(String commitID, String name) {
+    if (commitID != '*' && commitID != null) {
+        commitID = commitID.trim().substring(0, 7)
+    }
+    String tag = sh(returnStdout: true, script: "git tag  --sort=-creatordate -l \"${name}-*${commitID}*-production\" | head -n 1 ")
+    if (tag == '' || tag == null) {
+        echo "A git tag ${tag} does not exist for the keyword ${commitID} and the service ${name}"
+        return tag
+    }
+    echo "A git tag ${tag} exists for the keyword ${commitID} and the keyword ${name}"
+    return tag
+}
+// Takes commit ID as an input and returns the top 1 git tag where the tag name contains the commitID and the name
+String searchStableGitTag(String name) {
+    String tag = sh(returnStdout: true, script: "git tag  --sort=-creatordate -l \"${name}-*LATEST-STABLE*\" | head -n 1 ")
+    if (tag == '' || tag == null) {
+        echo "A stable git tag ${tag} does not exist for the service ${name}"
+        return tag
+    }
+    echo "A stable git tag ${tag} exists for the keyword ${name}"
+    return tag
+}
+
+//returns the git commit id of a git tag
+String findCommitIDOfATag(String tag) {
+    String commitID = sh(returnStdout: true, script: "git rev-list -n 1 ${tag}")
+    return commitID
+}
+
+//takes a merge commit id as input and writes all subcommit
+String writeAllSubCommits(String commit, String branchName) {
+    branchName =  branchName.trim()
+    sh """
+            git diff origin/${branchName} origin/master > commits.txt
+        """
+
+    echo "Listing all subcommits of this commit ${commit} and it's md5sum"
+    sh '''
+        cat commits.txt
+        md5sum commits.txt
+        '''
+    String md5Hash = sh(returnStdout: true, script: "md5sum commits.txt | awk '{print \$1}'")
+    return md5Hash
+}
+
+String generateMd5HashOfCommitDiff(String commitId) {
+    sh """
+            git diff ${commitId}^ ${commitId} > commits.txt
+        """
+
+    echo "Listing all subcommits of this commit ${commitId} and it's md5sum"
+    sh '''
+        cat commits.txt
+        md5sum commits.txt
+        '''
+    String md5Hash = sh(returnStdout: true, script: "md5sum commits.txt | awk '{print \$1}'")
+    return md5Hash
+}
+//undoes the last commit
+void gitSoftReset() {
+    sh '''
+        git reset --soft HEAD^
+    '''
+}
+
+//deletes a git tag
+void deleteGitTag(String tag) {
+    try {
+        sh """
+        git tag --delete ${tag}
+        git push --delete ${tag}
+    """
+    } catch (Exception e) {
+        echo "Unable to delete old git tag ${tag}: ${e}"
+    }
+}
+
+// commits the recent changes to git and returns true if a commit is done
+boolean gitCommit(String branch, String message, String tag) {
+    deleteGitTag(tag)
+    sh """
+
+     #!/usr/bin/env bash
+     set +x
+     export GIT_SSH_COMMAND="ssh -oStrictHostKeyChecking=no"
+     git pull origin ${branch}
+
+    """
+    String areFilesChanged = sh(returnStdout: true, script: 'git status --porcelain | wc -l')
+    echo "Files changed for commit ${areFilesChanged}"
+    if (areFilesChanged?.trim() != '0') {
+        sh """
+            git add .
+            git commit -m  "${message}"
+        """
+
+        if (tag != null && tag != '') {
+            sh """
+                git tag "${tag}"
+            """
+        }
+        return true
+    }
+    return false
+}
+
+boolean gitPushTags(String branch, String lastProductionCommit,  String tag) {
+    try {
+        if (tag != '' && tag != null) {
+            sh """
+                git tag ${tag} ${lastProductionCommit}
+                git push -f origin HEAD:${branch} --tags
+            """
+            return true
+        }
+    } catch (Exception e) {
+        echo "Error while pushing to git: ${ex}"
+        return false
+    }
+}
+
+// Pushes the commit to git and returns true if the push is successful
+boolean gitPush(String branch) {
+    try {
+        def pushToGit = sh(returnStdout: true, script: "git push -f origin HEAD:${branch} --tags")
+        echo pushToGit
+        return true
+    } catch (Exception ex) {
+        echo "Error while pushing to git: ${ex}"
+        //Uncommit the last commit.
+        gitSoftReset()
+        return false
+    }
+}
+
+/* ********************************************** Jenkins related functions ************************************** */
+//sets the current build name
+void setBuildName(String version, String branch) {
+    currentBuild.displayName = version
+    if (branch != 'master') {
+        currentBuild.displayName = "# ${env.BUILD_NUMBER} - branch ${branch} "
+    }
+}
+
+//returns a random label string postfixed to the service name
+// used as the name for jenkins agent
+String getWorkerLabel(String name) {
+    String label = "${name}-worker-${UUID.randomUUID()}"
+    if (label.length() > 63) {
+        label = label.substring(0, 63)
+    }
+    return label
+}
+
+/*  ***************************************   Semver related functions **************************** */
+// takes a semver tag and increments the patch version
+String incrementSemVerPatch(String semVerTag) {
+    if (checkSemanticVersionedTag(semVerTag)) {
+        //split it by "."
+        def splittedTags = semVerTag.tokenize('.')
+        //increment the patch version
+        def patchVersion = splittedTags[2].toInteger()
+        // increment the patch version by 1
+        patchVersion += 1
+        splittedTags[2] = patchVersion.toString()
+        String combinedTag = splittedTags.join('.')
+        return combinedTag
+    }
+}
+
+// takes a semver tag and increments the major version
+String incrementSemVerMajor(String semVerTag) {
+    if (checkSemanticVersionedTag(semVerTag)) {
+        //split it by "."
+        def splittedTags = semVerTag.tokenize('.')
+        //increment the patch version
+        def majorVersion = splittedTags[0].toInteger()
+        // increment the patch version by 1
+        majorVersion += 1
+        splittedTags[0] = majorVersion.toString()
+        String combinedTag = splittedTags.join('.')
+        return combinedTag
+    }
+}
+
+// takes a semver tag and increments the minor version
+String incrementSemVerMinor(String semVerTag) {
+    if (checkSemanticVersionedTag(semVerTag)) {
+        //split it by "."
+        def splittedTags = semVerTag.tokenize('.')
+        //increment the patch version
+        def minorVersion = splittedTags[1].toInteger()
+        // increment the patch version by 1
+        minorVersion += 1
+        splittedTags[1] = minorVersion.toString()
+        String combinedTag = splittedTags.join('.')
+        return combinedTag
+    }
+}
+//validates semver tag
+boolean checkSemanticVersionedTag(String semVerTag) {
+    if (!semVerTag.contains('.')) {
+        echo "${semVerTag} is not a valid semantic versioned tag"
+        return false
+    }
+    return true
+}
+
+/* ************************************** ECR functions ************************************ */
+//generates the ECR credentials and sources it in the Jenkins console
+void sourceRegistryCredentials() {
+    // this assumes that the registry is ECR
+    sh(script: "aws ecr get-login-password --region ${Constants.ECR_REGION} | nerdctl login --username AWS --password-stdin ${Constants.AWS_ID}.dkr.ecr.${Constants.ECR_REGION}.amazonaws.com", returnStdout: false)
+}
+
+/*  ************************************* Docker functions ********************************* */
+// Docker or Image related functions
+void buildImage(String registry, String dockerfileName, String dockerfilePath) {
+    sh 'pwd; ls * '
+    sh "DOCKER_CONFIG=/root/.dockerhubsecret nerdctl build --no-cache -t ${registry}:latest -f ${dockerfileName} ."
+}
+
+//tags the latest docker image with the given tagname
+//Note: right now, only a single tag is allowed
+void tagImage(String registry, String tagName) {
+    sh "nerdctl tag ${registry}:latest ${registry}:${tagName}"
+}
+
+//pushImage pushes the image to the repository
+void pushImage(String registry, String tagName) {
+    sh "nerdctl push ${registry}:${tagName}"
+}
+
+String getImageVersionFromGitTag(String gitTag) {
+
+    if (gitTag == '' || gitTag == null) {
+        echo 'gitTag is either empty or null'
+        return '1.0.0'
+    }
+    // git tag format - Concatenated by "-" . Concat (servicename, docker tag, service Commit ID, config Commit ID , timestamp, "rc" )
+    return gitTag.split('-')[1]
+}
+// parses gitTag and returns the docker image id
+String getLastImageVersionFromECR(Map args) {
+    env.IMAGE_TAG = ''
+    env.ECR_REPO = args.ecrRepo.trim()
+    env.ECR_REPO_SHORT_NAME = args.ecrRepo.split('/')[1]
+    def ecrImageTags = sh(script: "aws ecr describe-images --repository-name ${env.ECR_REPO_SHORT_NAME} --region ${Constants.ECR_REGION} --registry-id ${Constants.AWS_ID} --query 'sort_by(imageDetails,& imagePushedAt)[-1].imageTags[*]'", returnStdout: true)
+    println "Environment_image_tags and ecrimagetags ${env.IMAGE_TAG} : ${ecrImageTags}"
+    def lastImageTag =  Eval.me(ecrImageTags)
+    // When no image is present for the repo, above AWS command provides a stringified null
+    if (lastImageTag == null || lastImageTag.isEmpty() || lastImageTag == 'null' ) {
+        //When no image exists ,  start with 1.0.0
+        return '1.0.0'
+    }
+    Collections.sort(lastImageTag, Collections.reverseOrder())
+    lastImageTag = lastImageTag[0]
+    if (lastImageTag?.trim() == '' ||  lastImageTag?.trim() == 'null' || lastImageTag == null ) {
+        //When no image exists ,  start with 1.0.0
+        return '1.0.0'
+    }
+    return lastImageTag
+}
+
+/* ***************************************  General Functions *********************************************** */
+
+def copyConfigs(Map args) {
+    println('copying configs')
+    
+    if (args.serviceName == 'cqa' || args.serviceName == 'cqa-ui') {
+        // For CQA applications, create files/ directory and copy configs there
+        sh """
+        echo "=== CONFIGURATION COPYING DEBUG ==="
+        echo "Current directory: \$(pwd)"
+        echo "Contents of current directory:"
+        ls -la
+        echo "Checking if exotel_configs exists:"
+        ls -la exotel_configs/ || echo "exotel_configs directory not found"
+        echo "Checking exotel_configs contents:"
+        ls -la exotel_configs/ || echo "exotel_configs not accessible"
+        echo "Checking if sops-pgp exists:"
+        ls -la exotel_configs/sops-pgp/ || echo "sops-pgp directory not found"
+        echo "Checking if cqa directory exists:"
+        ls -la exotel_configs/cqa/ || echo "cqa directory not found"
+        echo "=== END DEBUG ==="
+        """
+        
+        sh """
+        mkdir -p files
+        echo "Created files directory"
+        """
+        
+        // Try to copy sops-pgp files if they exist
+        sh """
+        if [ -d "exotel_configs/sops-pgp" ] && [ "\$(ls -A exotel_configs/sops-pgp)" ]; then
+            echo "Copying sops-pgp files..."
+            cp exotel_configs/sops-pgp/* files/
+        else
+            echo "sops-pgp directory is empty or doesn't exist, skipping..."
+        fi
+        """
+        
+        // Try to copy cqa files if they exist
+        sh """
+        if [ -d "exotel_configs/cqa" ] && [ "\$(ls -A exotel_configs/cqa)" ]; then
+            echo "Copying cqa files..."
+            cp -r exotel_configs/cqa/* files/
+        else
+            echo "cqa directory is empty or doesn't exist, skipping..."
+        fi
+        """
+        
+        if (args.extraConfigPaths != null && !args.extraConfigPaths.isEmpty()) {
+            for (item in args.extraConfigPaths) {
+                sh """
+                    echo "Checking extra config path: ${item}"
+                    if [ -d "${item}" ] && [ "\$(ls -A ${item})" ]; then
+                        echo "Copying ${item} to files/"
+                        cp -r ${item} files/
+                    else
+                        echo "${item} is empty or doesn't exist, skipping..."
+                    fi
+                """
+            }
+        }
+    } else {
+        // For other services, use the original logic
+        sh """
+        cp exotel_configs/sops-pgp/* ${args.configFilePath}
+        """
+        if (args.extraConfigPaths != null && !args.extraConfigPaths.isEmpty()) {
+            for (item in args.extraConfigPaths) {
+                sh """
+                    cp -r ${item} ${args.configFilePath}/
+                """
+            }
+        }
+    }
+}
+
+// copy the latest stable deployment files to exotel_Deplyments repo
+// stage - intewgration, qa, qa_us1 , prod
+def copyLatestStableFiles(Map args, String stage) {
+    for (item in args.canaryFiles) {
+        try {
+            sh """
+         cp -rf exotel_deployments_stable/${args.serviceName}/${stage}/${item}.yaml exotel_deployments/${args.serviceName}/${stage}/${item}-stable.yaml
+        """
+        }catch (Exception ex) {
+            echo "Error while copying Stable file: ${ex} "
+        }
+    }
+}
+
+/* ************************************** Helm functions  ***************************************************** */
+
+void generateHelm(Map args, String stage, String imageTag, String commitID, String md5OfMerge) {
+    echo "Canary deployment is set to ${args.enableCanary} in the Jenkinsfile"
+    if (args.enableCanary == true) {
+        args.additionalHelmFlags = args.additionalHelmFlags + ' --set=istio.canary.enable=true '
+    }
+    String buildInfoPath = "${stage}/BUILD_INFO.txt"
+    sh """
+    helm template --name ${args.serviceName} . -f values/values.${stage}.yaml --set=deployment.service_image.tag="${
+        imageTag
+    }" --set=deployment.service_image.commit_id="${
+        commitID
+    }" --set=deployment.configs.commit_id="${args.configsCommitID}" --set=deploymentVersion="${
+        args.canaryColor
+    }" --set=stableDeploymentVersion=${args.stableColor} ${args.additionalHelmFlags} --output-dir ${stage}
+
+    echo MD5OFDIFF=${md5OfMerge}
+    echo COMMIT_ID=${commitID} > ${buildInfoPath}
+    echo CONFIGS_COMMIT_ID=${args.configsCommitID} >> ${buildInfoPath}
+    echo BUILD_TIME=`date` >> ${buildInfoPath}
+    """
+}
+
+// parses gitTag and returns the color i-e version of the deployment
+def getColor(String gitTag) {
+    Map colorInfo = [:]
+    if (gitTag == '' || gitTag == null) {
+        echo 'Error while parsing gitTag to find the deployment version. gitTag is either empty or null'
+        colorInfo.currentColor = 'blue'
+        colorInfo.lastColor = 'green'
+        return colorInfo
+    }
+    String color = gitTag.split('-')[5]
+    //this switch case is needed because earlier tags dont have color information at the index 6
+    switch (color) {
+        case 'blue':
+            colorInfo.currentColor = 'green'
+            colorInfo.lastColor = 'blue'
+            return colorInfo
+        case 'green':
+            colorInfo.currentColor = 'blue'
+            colorInfo.lastColor = 'green'
+            return colorInfo
+        default:
+            colorInfo.currentColor = 'blue'
+            colorInfo.lastColor = 'green'
+            return colorInfo
+    }
+}
+
+// Reads environment variables injected from jenkins job
+def readEnvironmentVariable(Map args) {
+    println('reading env variables injected from Jenkins job')
+    // is null check needed on BUILD_ENV
+    if (env.BUILD_ENV) {
+        args.buildEnv =  env.BUILD_ENV
+    }
+    if (env.INTEGRATION_BRANCH) {
+        args.integrationBranch = env.INTEGRATION_BRANCH
+    }
+    if (env.buildtype) {
+        args.deployRepo = env.buildtype
+    }
+    if (env.STAMP) {
+        args.integrationStage = env.STAMP
+    }
+    if (env.EXOTEL_CONFIGS_BRANCH) {
+        args.exotelConfigBranch = env.EXOTEL_CONFIGS_BRANCH
+    }
+    if (env.DEPLOYMENT_REPO) {
+        args.deploymentRepo = env.DEPLOYMENT_REPO
+    }
+    if (env.DEPLOYMENT_BRANCH) {
+        args.deploymentBranch = env.DEPLOYMENT_BRANCH
+    }
+    // when buildEnv is devbox read branch name from environment variables injected from build job
+    // otherwise keep what's in jenkinsfile.
+    if (args.buildEnv == Constants.DEVBOX_STAGE) {
+        if (env.EXOTEL_CODE_BRANCH) {
+            args.exotelCodeBranch = env.EXOTEL_CODE_BRANCH
+        }
+        args.exotelConfigBranch = env.EXOTEL_CONFIGS_BRANCH
+        args.ecrRepo = Constants.BRANCH_BUILD_ECR_REPO
+    }
+    println("aregs stamp and integration stage one by one")
+    println(args.integrationStage)
+}
+// generate image tag for devbox env
+def generateDevboxImageTag(Map pipelineMap, Map args) {
+    println('generating image tag')
+    pipelineMap.imageTag = args.serviceName.concat('-').concat(args.lastCommitId).concat('-').concat(args.serviceBranch.replace('/', '-')).concat('-1.0')
+}
+
+// Print build info
+def printBuildInfo(Map pipelineMap, Map args) {
+    println('============================================================================')
+    if (args.buildEnv) {
+        println('Building for: ' + args.buildEnv)
+    }
+    println('Service branch used for build: ' + args.serviceBranch)
+    println('Exotel configs branch used for build: ' + args.exotelConfigBranch)
+    println('Exotel code branch used for build: ' + args.exotelCodeBranch)
+    println('Exotel deployment repo: ' + args.deploymentRepo)
+    println('Exotel deployment branch: ' + args.deploymentBranch)
+    println('Image tag: ' + pipelineMap.imageTag)
+    println("Merge commit Id: ${pipelineMap.mergeCommitID}")
+    println("Merged branch: ${pipelineMap.mergedBranch}")
+    println("Merge md5hash: ${pipelineMap.md5OfMerge}")
+    println("Code commit Id: ${pipelineMap.commitID}")
+    println("configs commit Id: ${args.configsCommitID}")
+    println('============================================================================')
+}
+
+return this
+
+---
+
+# /Users/shashidhara.reddy/jenkins-pipeline/src/com/exotel/MasterWorkflow.groovy
+
+package com.exotel
+
+import com.exotel.Constants
+
+import groovy.json.internal.Exceptions
+
+//import org.apache.tools.ant.taskdefs.optional.junit.Constants;
+
+//declare pipelineSteps
+def pipelineSteps
+//git tag of exotel_deployments for this service
+String tag
+
+def Init(Map args) {
+    //   Steps to be followed in Integration Pipeline //
+    // Find the dockerfile
+    // Find the commit id
+    // Check if the commit has a docker image attached to it . if yes , dont build image else build
+    // Push the built image
+    // Override tag . Alert if there was override failure
+    // Create helm charts for integration setup
+
+    pipelineSteps = new JenkinsPipelineSteps()
+
+    //commitID of the service repo
+    String commitID
+    //imageTag is the tag of the new image going to be built
+    String imageTag
+    //exotel_deployment's Production commit id
+    String deploymentsCommitID = ''
+    //exotel configs commitID
+    String configsCommitID
+    // md5 hash of all subcommits of a merge commit
+    String md5OfMerge
+    String productionVersionColor
+    stage('Compute Git Commits') {
+        String mergeCommitID = pipelineSteps.getCommitId()
+        if (pipelineSteps.checkMergeCommit(mergeCommitID) == false) {
+            throw new Exception('The pipeline has not been triggered by a Merge commit. Aborting build')
+        }
+    //get the branch name involved in the merge
+    //String mergedBranch = pipelineSteps.getMergedBranch(mergeCommitID)
+    // write all subcommits of this merge commit id
+    //md5OfMerge = pipelineSteps.writeAllSubCommits(mergeCommitID, mergedBranch)
+    //commitID = pipelineSteps.getFirstSubcommitOfaMerge(mergeCommitID)
+    }
+    stage('Find last production tag') {
+        sshagent(['cicd-exotel']) {
+            dir('exotel_deployments') {
+                // tag - top 1 tag where the tag name contains the serviceName and the commitID
+                tag = pipelineSteps.searchProductionGitTag('*', args.serviceName)
+                imageTag = tag.split('-')[1]
+                commitID = tag.split('-')[2]
+                configsCommitID = tag.split('-')[3]
+                md5OfMerge = tag.split('-')[4]
+                productionVersionColor = tag.split('-')[5]
+                try {
+                    deploymentsCommitID = pipelineSteps.findCommitIDOfATag(tag)
+                }catch (Exception e) {
+                    echo "Error while finding the commit ID of last production movement: ${e}"
+                    deploymentsCommitID = ''
+                }
+            }
+        }
+    }
+
+    if (deploymentsCommitID != '' && deploymentsCommitID != null) {
+        stage('Promote Stable tag') {
+            sshagent(['cicd-exotel']) {
+                dir('exotel_deployments') {
+                    boolean gitPushed = false
+                    //counter is to shortcircuit the loop. Try only 5 times to push git
+                    //else mark the build as failure
+                    int counter = 0
+                    while (gitPushed == false && counter < 5) {
+                        gitPushed = pipelineSteps.gitPushTags('master', deploymentsCommitID, "${args.serviceName.trim()}-${imageTag.trim()}-${commitID.trim()}-${configsCommitID.trim()}-${md5OfMerge.trim()}-${productionVersionColor.trim()}-LATEST-STABLE")
+                        counter += 1
+                        if (gitPushed) {
+                            break
+                        }
+                    }
+                    if (gitPushed == false ) {
+                        throw new Exception('Unable to push the changes to Git. Please check your repository commits/ settings')
+                    }
+                }
+            }
+        }
+    }
+}
+
+return this
+
+---
+
+# /Users/shashidhara.reddy/jenkins-pipeline/src/com/exotel/ProdWorkflow.groovy
+
+package com.exotel
+
+import com.exotel.Constants
+
+import groovy.json.internal.Exceptions
+
+//import org.apache.tools.ant.taskdefs.optional.junit.Constants;
+
+//declare pipelineStep
+def pipelineStep
+//define common workflow steps
+def commonWorkflowStep
+
+def Init(Map args) {
+    pipelineStep = new JenkinsPipelineSteps()
+    commonWorkflowStep = new CommonWorkflowSteps()
+
+    def pipelineMap = commonWorkflowStep.run(pipelineStep, args)
+
+    // for mum1
+    commonWorkflowStep.generateHelmForStage(pipelineStep, pipelineMap, args, Constants.MUM1_STAGE)
+    commonWorkflowStep.commitDeploymentFilesForTheStage(pipelineStep, pipelineMap, args, Constants.MUM1_STAGE)
+    // for Prod
+    commonWorkflowStep.generateHelmForStage(pipelineStep, pipelineMap, args, Constants.PROD_STAGE)
+    commonWorkflowStep.commitDeploymentFilesForTheStage(pipelineStep, pipelineMap, args, Constants.PROD_STAGE)
+    pipelineStep.printBuildInfo(pipelineMap, args)
+}
+
+return this
+
+---
+
+# /Users/shashidhara.reddy/jenkins-pipeline/src/com/exotel/QAWorkflow.groovy
+
+package com.exotel
+
+import com.exotel.Constants
+
+import groovy.json.internal.Exceptions
+import org.codehaus.groovy.control.messages.ExceptionMessage
+
+//import org.apache.tools.ant.taskdefs.optional.junit.Constants;
+
+//declare pipelineStep
+def pipelineStep
+//define common workflow steps
+def commonSteps
+// git tag of exotel_deployments
+String tag
+
+def Init(Map args) {
+    // Steps to be followed in Integration Pipeline //
+    // Find the dockerfile
+    // Find the commit id
+    // Check if the commit has a docker image attached to it . if yes , dont build image else build
+    // Push the built image
+    // Override tag . Alert if there was override failure
+    // Create helm charts for integration setup
+
+    pipelineStep = new JenkinsPipelineSteps()
+    commonSteps = new CommonWorkflowSteps()
+
+    // commenting these steps because in case of qa branch we run prod workflow and that workflow has these steps in it.
+    // but need to check why these was there in the first place
+
+    // commitID of the service Repo
+    // String commitID
+    // imageTag is the tag of the new image going to be built
+    // String imageTag
+    // md5hash of all subcommits of a current merge commit
+    // String md5OfMerge
+
+    // def commonMap = commonSteps.run(pipelineSteps, args )
+    // commitID = commonMap.commitID
+    // mageTag = commonMap.imageTag
+    // tag = commonMap.tag
+    // md5OfMerge = commonMap.md5OfMerge
+}
+
+return this
+
+---
+
+# /Users/shashidhara.reddy/jenkins-pipeline/src/infra/ecr/EcrPipelineBuilder.groovy
+
+package infra.ecr;
+
+
+//declare pipelineSteps
+def pipelineSteps;
+// branch name of service repository
+def scmBranch;
+// declare integrationWorkflow
+def integrationWF;
+//declare qaWorkflow
+def qaWF;
+//declare productionWorkflow
+def prodWF;
+//declare masterWorkflow
+def masterWF;
+//qa approver
+def approver;
+
+void createBuilder(Map args) {
+    echo 'Initializing PipelineBuilder';
+    pipelineSteps = new JenkinsPipelineSteps();
+
+    def label = pipelineSteps.getWorkerLabel(args.serviceName);
+
+    // declare POD template definition
+    podTemplate(label: label, namespace: 'infra', serviceAccount: 'jenkins', containers: [
+            containerTemplate(name: 'terraform', image: 'exotelorg/terraform:0.12.17', command: 'cat', ttyEnabled: true),
+    ], imagePullSecrets: ['exotelorg-dockerhub-secret'], volumes: [
+            hostPathVolume(mountPath: '/run/containerd', hostPath: '/run/containerd'),
+            hostPathVolume(mountPath: '/var/lib/containerd', hostPath: '/var/lib/containerd'),
+            hostPathVolume(mountPath: '/var/lib/nerdctl', hostPath: '/var/lib/nerdctl'),
+            hostPathVolume(mountPath: '/opt/cni/bin', hostPath: '/opt/cni/bin'),
+            hostPathVolume(mountPath: '/etc/cni/net.d', hostPath: '/etc/cni/net.d'),
+            volumeMounts: [mountPath: '/root/.dockerhubsecret', name: 'dockerhub-creds']
+    ]) {
+        node(label) {
+
+            //run initialization steps
+            // this sets the git env vars
+            pipelineSteps.initialize();
+            cloneRepos(args)
+            timeout(activity: true, time: 5, unit: "DAYS") {
+                approver = input id: 'UserInput', message: 'Promote to Production Environments ?', ok: 'Approve', submitter: "athavankanapuli,sushant,shubham", submitterParameter: 'APPROVAL'
+            }
+            echo "Approved person is ${approver}"
+            if (${approver} != "athavankanapuli" || ${approver} != "shubham" || ${approver} != "sushant") {
+
+                sh "ls *"
+                dir("aws/terraform/ap-southeast-1/ecr"){
+                    sh """
+                        terraform -v
+                        ls *
+                    """
+                }
+            } else {
+                echo 'You are not supposed to approve this build'
+            }
+
+        }
+    }
+}
+
+def cloneRepos(Map args) {
+
+    stage("Clone exotel_cloud_resource") {
+        //parallel Clone_service_repo: {
+        // checkout SCM
+        stage("Clone repo") {
+            def repo = checkout scm;
+            scmBranch = "develop"
+        }
+    }
+}
+
+return this
+
+---
+
+# /Users/shashidhara.reddy/jenkins-pipeline/src/infra/ecr/JenkinsPipelineSteps.groovy
+
+
+package infra.ecr;
+
+//initializes the pipeline
+void initialize() {
+    echo 'Initializing Pipeline steps. ';
+    echo 'Setting git credentials'
+    sh "git config --global user.name cicd-exotel"
+    sh "git config --global user.email cicd@exotel.in"
+}
+
+//cleans the workspace
+void cleanDirectory() {
+    echo 'Cleaning workspace';
+    deleteDir();
+}
+
+void createDirectory(String name) {
+    echo 'Creating directory ' + name
+    sh "mkdir -p ${name}"
+}
+
+String readFile(String fileName) {
+    String contents = new File(fileName).getText('utf-8')
+    return contents
+}
+
+/* ******************************************************************* Git related functions ********************* */
+//checkout clones the scm repo
+String checkout(String url, String branch) {
+    def result = checkout([$class: 'GitSCM', branches: [[name: '*/' + branch]], doGenerateSubmoduleConfigurations: false, extensions: [[$class: 'CloneOption', honorRefspec: true, noTags: false, reference: '', shallow: false, timeout: 10]], submoduleCfg: [], userRemoteConfigs: [[credentialsId: Constants.GIT_CREDENTIAL_KEY, url: url]]])
+    // first 7 chars of a commit id makes it unique
+    return result.GIT_COMMIT.trim().substring(0, 7)
+}
+
+//sparse checkouts certain folders of the repo
+String sparseCheckout(String url, Map args) {
+//    def result = checkout([$class: 'GitSCM', branches: [[name: '*/' + args.exotelCodeBranch]], doGenerateSubmoduleConfigurations: false, extensions: [[$class: 'SparseCheckoutPaths', sparseCheckoutPaths: args.exotelCodePaths], [$class: 'CheckoutOption', timeout: 10], [$class: 'CloneOption', depth: 1, noTags: false, reference: '', shallow: true, timeout: 10]], submoduleCfg: [], userRemoteConfigs: [[credentialsId: Constants.GIT_CREDENTIAL_KEY, url: url]]])
+//    // first 7 chars of a commit id makes it unique
+//    return result.GIT_COMMIT.trim().substring(0, 7)
+scm {
+        git {
+            reference(url)
+            configure { git ->
+                git / 'extensions' / 'hudson.plugins.git.extensions.impl.SparseCheckoutPaths' / 'sparseCheckoutPaths' {
+                    args.exotelCodePaths.each { mypath ->
+                        'hudson.plugins.git.extensions.impl.SparseCheckoutPath' {
+                            path("${mypath}")
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// gets the current build branch of scm repo
+String getBranch() {
+    String branchName;
+    sh "git show-ref | grep `git rev-parse HEAD` | grep remotes | grep -v HEAD | sed -e 's/.*remotes.origin.//' > branch.txt"
+    branchName = readFile("branch.txt").trim()
+    echo 'Building Branch ' + branchName
+    return branchName
+}
+
+// gets the commit id
+String getCommitId() {
+    String commitId = sh(returnStdout: true, script: 'git rev-parse HEAD').trim()
+    return commitId
+}
+
+//checks if current commit is a merge commit and responds with a boolean
+boolean checkMergeCommit(String commitID){
+    //this returns 0 if it is a merge commit. 1 if it is not a merge commit
+    String checkMerge = sh(returnStdout: true, script: "git show --summary ${commitID} | grep -q  ^Merge: ; echo \$?")
+    echo "Result of checkMergeCommit is ${checkMerge}"
+    if (checkMerge.trim() == "0"){
+        return true
+    }else{
+        return false
+    }
+}
+
+//returns boolean if there is a diff between master and current branch
+boolean findDiffWithMaster(String branch){
+    if (branch == "master"){
+        return true
+    }
+    String diffLines = sh(returnStdout: true, script: "git diff ${branch}..master | wc -l")
+    if(diffLines.trim() == "0"){
+        return false
+    }
+    //there exist a diff. Hence run the complete pipeline
+    return true
+}
+
+
+// finds the common ancestor of two git branches
+// gives the latest commit id between two branches
+String getMergeBase(String firstBranch, String secondBranch) {
+    String commitId = sh(returnStdout: true, script: "git merge-base ${firstBranch} ${secondBranch}")
+    echo "Merge base between ${firstBranch} and ${secondBranch} is ${commitId}"
+    return commitId
+}
+
+// gets the first commit id under a merge commit
+String getFirstSubcommitOfaMerge(String mergeCommitId) {
+    String subCommit = sh(returnStdout: true, script: "git rev-list HEAD | sed -n 2p")
+    echo "Subcommit under the Merge commit is ${subCommit}"
+    return subCommit.trim().substring(0, 7)
+}
+
+// Takes commit ID as an input and returns the top 1 git tag where the tag name contains the commitID and the name
+String searchGitTag(String commitID, String name) {
+    if(commitID != "*" && commitID != null){
+        commitID = commitID.trim().substring(0,7)
+    }
+    String tag = sh(returnStdout: true, script: "git tag  --sort=-creatordate -l \"${name}-*${commitID}*-rc\" | head -n 1 ")
+    if (tag == "" || tag == null){
+        echo "A git tag ${tag} does not exist for the keyword ${commitID} and the service ${name}"
+    }
+    echo "A git tag ${tag} exists for the keyword ${commitID} and the service ${name}"
+    return tag
+}
+
+// Takes commit ID as an input and returns the top 1 git tag where the tag name contains the commitID and the name and the keyword production
+String searchProductionGitTag(String commitID, String name) {
+    if(commitID != "*" && commitID != null){
+        commitID = commitID.trim().substring(0,7)
+    }
+    String tag = sh(returnStdout: true, script: "git tag  --sort=-creatordate -l \"${name}-*${commitID}*-production\" | head -n 1 ")
+    if (tag == "" || tag == null){
+        echo "A git tag ${tag} does not exist for the keyword ${commitID} and the service ${name}"
+        return tag
+    }
+    echo "A git tag ${tag} exists for the keyword ${commitID} and the keyword ${name}"
+    return tag
+}
+// Takes commit ID as an input and returns the top 1 git tag where the tag name contains the commitID and the name
+String searchStableGitTag(String name) {
+    String tag = sh(returnStdout: true, script: "git tag  --sort=-creatordate -l \"${name}-*LATEST-STABLE*\" | head -n 1 ")
+    if (tag == "" || tag == null){
+        echo "A stable git tag ${tag} does not exist for the service ${name}"
+        return tag
+    }
+    echo "A stable git tag ${tag} exists for the keyword ${name}"
+    return tag
+}
+
+//returns the git commit id of a git tag
+String findCommitIDOfATag(String tag) {
+    String commitID = sh(returnStdout: true, script: "git rev-list -n 1 ${tag}")
+    return commitID
+
+}
+
+//takes a merge commit id as input and writes all subcommit
+String writeAllSubCommits(String commit) {
+    //check if it is a merge commit
+    String countOfCommits = sh(returnStdout: true, script: "git log --pretty=format:'%h' ${commit}^..${commit} | wc -l")
+    if (countOfCommits != "1") {
+        sh(returnStdout: true, script: "git log  --pretty=format:'%h' ${commit}^..${commit} | sed -n '2,\$p' > commits.txt")
+    } else {
+        echo "Warning: This is not a merge commit"
+        sh(returnStdout: true, script: "git log  --pretty=format:'%h' ${commit}^..${commit}   > commits.txt")
+    }
+    echo "Listing all subcommits of this commit ${commit} and it's md5sum"
+    sh """
+        cat commits.txt
+        md5sum commits.txt
+        """
+    String md5Hash = sh(returnStdout: true, script: "md5sum commits.txt | awk '{print \$1}'")
+    return md5Hash
+
+}
+//undoes the last commit
+void gitSoftReset() {
+    sh """
+        git reset --soft HEAD^
+    """
+}
+
+//deletes a git tag
+void deleteGitTag(String tag) {
+    try {
+
+        sh """
+        git tag --delete ${tag}
+        git push --delete ${tag}
+    """
+    } catch (Exception e) {
+        echo "Unable to delete old git tag ${tag}: ${e}"
+    }
+}
+
+// commits the recent changes to git and returns true if a commit is done
+boolean gitCommit(String branch, String message, String tag) {
+    deleteGitTag(tag)
+    sh """
+
+     #!/usr/bin/env bash
+     set +x 
+     export GIT_SSH_COMMAND="ssh -oStrictHostKeyChecking=no"
+     git pull origin ${branch}
+
+    """
+    String areFilesChanged = sh(returnStdout: true, script: "git status --porcelain | wc -l")
+    echo "Files changed for commit ${areFilesChanged}"
+    if (areFilesChanged?.trim() != "0") {
+        sh """
+            git add .
+            git commit -m  "${message}"
+        """
+
+        if (tag != null && tag != "") {
+            sh """
+                git tag "${tag}"
+            """
+        }
+        return true
+    }
+    return false
+}
+
+boolean gitPushTags(String branch, String lastProductionCommit,  String tag) {
+    try {
+        if (tag != "" && tag != null) {
+            sh """
+                git tag ${tag} ${lastProductionCommit}
+                git push -f origin HEAD:${branch} --tags
+            """
+            return true
+        }
+    } catch (Exception e) {
+        echo "Error while pushing to git: ${ex}"
+        return false
+    }
+}
+
+// Pushes the commit to git and returns true if the push is successful
+boolean gitPush(String branch) {
+    try {
+        def pushToGit = sh(returnStdout: true, script: "git push -f origin HEAD:${branch} --tags")
+        echo pushToGit
+        return true
+    } catch (Exception ex) {
+        echo "Error while pushing to git: ${ex}"
+        //Uncommit the last commit.
+        gitSoftReset()
+        return false
+    }
+}
+
+
+/* ********************************************** Jenkins related functions ************************************** */
+//sets the current build name
+void setBuildName(String version, String branch) {
+    currentBuild.displayName = version
+    if (branch != 'master') {
+        currentBuild.displayName = "# ${env.BUILD_NUMBER} - branch ${branch} "
+    }
+}
+
+//returns a random label string postfixed to the service name
+// used as the name for jenkins agent
+String getWorkerLabel(String name) {
+    def label = "${name}-worker-${UUID.randomUUID().toString()}";
+    return label
+}
+
+
+/*  ***************************************   Semver related functions **************************** */
+// takes a semver tag and increments the patch version
+String incrementSemVerPatch(String semVerTag) {
+    if (checkSemanticVersionedTag(semVerTag)) {
+        //split it by "."
+        def splittedTags = semVerTag.tokenize(".")
+        //increment the patch version
+        def patchVersion = splittedTags[2].toInteger();
+        // increment the patch version by 1
+        patchVersion += 1
+        splittedTags[2] = patchVersion.toString()
+        String combinedTag = splittedTags.join(".");
+        return combinedTag
+    }
+}
+
+// takes a semver tag and increments the major version
+String incrementSemVerMajor(String semVerTag) {
+    if (checkSemanticVersionedTag(semVerTag)) {
+        //split it by "."
+        def splittedTags = semVerTag.tokenize(".")
+        //increment the patch version
+        def majorVersion = splittedTags[0].toInteger();
+        // increment the patch version by 1
+        majorVersion += 1
+        splittedTags[0] = majorVersion.toString()
+        String combinedTag = splittedTags.join(".");
+        return combinedTag
+    }
+}
+
+// takes a semver tag and increments the minor version
+String incrementSemVerMinor(String semVerTag) {
+    if (checkSemanticVersionedTag(semVerTag)) {
+        //split it by "."
+        def splittedTags = semVerTag.tokenize(".")
+        //increment the patch version
+        def minorVersion = splittedTags[1].toInteger();
+        // increment the patch version by 1
+        minorVersion += 1
+        splittedTags[1] = minorVersion.toString()
+        String combinedTag = splittedTags.join(".");
+        return combinedTag
+    }
+}
+//validates semver tag
+boolean checkSemanticVersionedTag(String semVerTag) {
+    if (!semVerTag.contains(".")) {
+        echo "${semVerTag} is not a valid semantic versioned tag"
+        return false
+    }
+    return true
+}
+
+/* ************************************** ECR functions ************************************ */
+//generates the ECR credentials and sources it in the Jenkins console
+void sourceRegistryCredentials() {
+    // this assumes that the registry is ECR
+    sh(script: "aws ecr get-login-password --region ${Constants.ECR_REGION} | nerdctl login --username AWS --password-stdin ${Constants.AWS_ID}.dkr.ecr.${Constants.ECR_REGION}.amazonaws.com", returnStdout: false)
+}
+
+
+/*  ************************************* Docker functions ********************************* */
+// Docker or Image related functions
+void buildImage(String registry, String dockerfileName, String dockerfilePath) {
+    sh "pwd; ls * "
+    sh "DOCKER_CONFIG=/root/.dockerhubsecret nerdctl build --no-cache -t ${registry}:latest -f ${dockerfileName} ."
+}
+
+//tags the latest docker image with the given tagname
+//Note: right now, only a single tag is allowed
+void tagImage(String registry, String tagName) {
+    sh "nerdctl tag ${registry}:latest ${registry}:${tagName}"
+}
+
+//pushImage pushes the image to the repository
+void pushImage(String registry, String tagName) {
+    sh "nerdctl push ${registry}:${tagName}"
+}
+
+// parses gitTag and returns the docker image id
+String getDockerTag(String gitTag) {
+    if (gitTag == "" || gitTag == null) {
+        echo "Error while parsing gitTag to find the docker imageID. gitTag is either empty or null"
+        return "1.0.0"
+    }
+    return gitTag.split("-")[1];
+
+}
+
+
+/* ***************************************  General Functions *********************************************** */
+
+def copyConfigs(Map args) {
+    sh """
+    cp exotel_configs/sops-pgp/* ${args.configFilePath}
+    """
+    if (!args.extraConfigPaths.isEmpty()) {
+        for (item in args.extraConfigPaths) {
+            sh """
+                cp ${item} ${args.configFilePath}/
+            """
+        }
+    }
+}
+
+// copy the latest stable deployment files to exotel_Deplyments repo
+// stage - intewgration, qa, qa_us1 , prod
+def copyLatestStableFiles(Map args, String stage) {
+    for (item in args.canaryFiles) {
+        try{
+            sh """  
+         cp -rf exotel_deployments_stable/${args.serviceName}/${stage}/${item}.yaml exotel_deployments/${args.serviceName}/${stage}/${item}-stable.yaml
+        """
+        }catch(Exception ex){
+            echo "Error while copying Stable file: ${ex} "
+        }
+    }
+}
+
+/* ************************************** Helm functions  ***************************************************** */
+
+void generateHelm(Map args, String stage, String imageTag, String commitID) {
+    sh """
+    helm template --name ${
+        args.serviceName
+    } . -f values/values.${stage}.yaml --set=service_image.tag="${
+        imageTag
+    }" --set=configs.commit_id="${
+        args.configsCommitID
+    }" --set=service_image.commit_id="${
+        commitID
+    }" --set=deploymentVersion="${args.canaryColor}" --set=stableDeploymentVersion=${args.stableColor} ${args.additionalHelmFlags} --output-dir ${stage}
+
+    """
+}
+
+
+// parses gitTag and returns the color i-e version of the deployment
+def getColor(String gitTag) {
+    Map colorInfo = [:]
+    if (gitTag == "" || gitTag == null) {
+        echo "Error while parsing gitTag to find the deployment version. gitTag is either empty or null"
+        colorInfo.currentColor = "blue"
+        colorInfo.lastColor = "green"
+        return colorInfo
+    }
+    String color = gitTag.split("-")[5];
+    //this switch case is needed because earlier tags dont have color information at the index 6
+    switch (color) {
+        case "blue":
+            colorInfo.currentColor = "green"
+            colorInfo.lastColor = "blue"
+            return colorInfo
+        case "green":
+            colorInfo.currentColor = "blue"
+            colorInfo.lastColor = "green"
+            return colorInfo
+        default:
+            colorInfo.currentColor = "blue"
+            colorInfo.lastColor = "green"
+            return colorInfo
+    }
+
+}
+
+return this
+
+---
+
+# /Users/shashidhara.reddy/jenkins-pipeline/src/io/estrado/Pipeline.groovy
+
+package io.estrado 
+
+import io.estrado.pipelines.*
+
+
+/* The developer invokes the pipelines 
+with these methods */
+
+//Athavan Dec 4, 2019
+// This library has been started as a POC
+// It is currently too verbose and contains duplicate codes across Pipeline files
+// Have to implement Class strictures to reduce Code duplication and make it more pragmatic
+
+def runDefaultPipeline(Map args) {
+    DefaultBuildPipeline pipeline = new DefaultBuildPipeline()
+    pipeline.Run(args)
+}
+
+def runDefaultJavaPipeline(Map args) {
+   DefaultJavaPipeline pipeline = new DefaultJavaPipeline()
+    pipeline.Run(args)
+}
+
+def runDefaultHelmPipeline(Map args) {
+    DefaultHelmPipeline pipeline = new DefaultHelmPipeline()
+    pipeline.Run(args)
+}
+
+def runDefaultReactPipeline(Map args) {
+    DefaultReactPipeline pipeline = new DefaultReactPipeline()
+    pipeline.Run(args)
+}
+return this
+
+---
+
+# /Users/shashidhara.reddy/jenkins-pipeline/src/io/estrado/artifact/Artifactory.groovy
+
+package io.estrado.artifact
+
+// Gets AWS ECR credentials
+def sourceECRCredentials() {
+    def applyCredentials = sh(script: "aws ecr get-login-password --region ${env.ECR_REGION} | nerdctl login --username AWS --password-stdin ${env.AWS_ID}.dkr.ecr.${env.ECR_REGION}.amazonaws.com", returnStdout: true)
+}
+
+//Gets an array of SHA digests for the ECR image(from Environment)
+def getECRImageDigests(Integer count){
+    def digests = sh(script: "aws ecr describe-images --repository-name ${env.ECR_REPO_SHORT_NAME} --registry-id ${env.AWS_ID} --region ${env.ECR_REGION} --query 'sort_by(imageDetails,& imagePushedAt)[0:${count}].imageDigest'", returnStdout: true)
+    return digests
+}
+
+//Computes and returns the latest Tag for the ECR image repository
+def getLatestImageTag(){
+    if (env.IMAGE_TAG?.trim()){
+        return env.IMAGE_TAG
+    }
+    def ecrImageTags = sh(script: "aws ecr describe-images --repository-name ${env.ECR_REPO_SHORT_NAME} --region ${env.ECR_REGION} --registry-id ${env.AWS_ID} --query 'sort_by(imageDetails,& imagePushedAt)[-1].imageTags[*]'", returnStdout: true)
+    println "Hulk ${env.IMAGE_TAG} : ${ecrImageTags}"
+    def lastImageTag =  Eval.me(ecrImageTags)
+    // When no image is present for the repo, above AWS command provides a stringified null
+    if (lastImageTag == null || lastImageTag.isEmpty() || lastImageTag == "null" ){
+        //When no image exists ,  start with 1.0.0
+        return "1.0.0"
+    }
+    Collections.sort(lastImageTag, Collections.reverseOrder());
+    lastImageTag = lastImageTag[0]
+    if (lastImageTag?.trim() == "" ||  lastImageTag?.trim() == "null" || lastImageTag == null ){
+        //When no image exists ,  start with 1.0.0
+        return "1.0.0"
+    }
+    def tag_array = lastImageTag.tokenize(".")
+    def increment = (tag_array[2].replace("\"", "") as Integer) + 1
+    tag_array.set(2, increment)
+    return tag_array.join(".").replace("\"", "")
+}
+
+def getLatestTagForHelm(){
+    if (env.IMAGE_TAG?.trim()){
+        return env.IMAGE_TAG
+    }
+    def ecrImageTags = sh(script: "aws ecr describe-images --repository-name ${env.ECR_REPO_SHORT_NAME} --region ${env.ECR_REGION} --registry-id ${env.AWS_ID} --query 'sort_by(imageDetails,& imagePushedAt)[-1].imageTags[*]'", returnStdout: true)
+    def lastImageTag =  Eval.me(ecrImageTags)
+    // When no image is present for the repo, above AWS command provides a stringified null
+    if (lastImageTag == null || lastImageTag.isEmpty() || lastImageTag == "null" ){
+        //When no image exists ,  start with 1.0.0
+        return "1.0.0"
+    }
+    Collections.sort(lastImageTag, Collections.reverseOrder());
+    lastImageTag = lastImageTag[0]
+    if (lastImageTag?.trim() == "" ||  lastImageTag?.trim() == "null" || lastImageTag == null ){
+        //When no image exists ,  start with 1.0.0
+        return "1.0.0"
+    }
+    return lastImageTag
+}
+
+---
+
+# /Users/shashidhara.reddy/jenkins-pipeline/src/io/estrado/components/Common.groovy
+
+package io.estrado.components
+
+//def args = null
+//this.args = args
+//Package common contains all common methods for pipelines
+
+
+// creates a random worker label with a prefix of service name
+def workerLabel(String serviceName) {
+    def label = "${serviceName}-worker-${UUID.randomUUID().toString()}"
+    return label.take(50)
+}
+
+//Injects all default variable into the workflow pipeline
+// Users have the liberty to override these default variable by passing these
+// vars from Jenkinsfile
+def loadDefaultVariables(Map args) {
+
+    env.CHATURL = args.chatURL ?: "https://chat.googleapis.com/v1/spaces/AAAAiNTfWCw/messages?key=AIzaSyDdI0hCZtE6vySjMm-WEfRq3CPzqKqqsHI&token=VBYFaQjJFfgSGtFp_VofzkFt2Nlz6Y1vJfc3wksECFY%3D&threadKey=${args.serviceName}"
+    env.ECR_REGION = args.ecrRegion ?: "ap-southeast-1"
+    env.AWS_ID = args.awsID ?: "350027074327"
+    env.IMAGE_TAG = args.overrideImageTag.trim()
+    env.ECR_REPO = args.ecrRepo.trim()
+    env.ECR_REPO_SHORT_NAME = args.ecrRepo.split("/")[1]
+    // ECR repo name will be in the format of 3000098398.dkr.ap-southeast-1/starix
+    env.FINAL_MESSAGE = ""
+
+    //set Git Env variables
+    def COMMIT_ID
+    def COMMIT_SHA
+    
+    if (args.serviceName == 'cqa') {
+        // For CQA, get commit info from cqa-source directory
+        echo "Checking for cqa-source directory..."
+        if (fileExists('cqa-source')) {
+            echo "cqa-source directory found, getting commit info..."
+            dir('cqa-source') {
+                COMMIT_ID = sh(script: "git rev-parse HEAD ", returnStdout: true)
+                COMMIT_SHA = COMMIT_ID.substring(0, 7)
+            }
+        } else {
+            echo "cqa-source directory not found, using fallback commit info..."
+            COMMIT_ID = "cqa-${System.currentTimeMillis()}"
+            COMMIT_SHA = COMMIT_ID.substring(0, 7)
+        }
+    } else {
+        // For other services, get commit info from current directory
+        COMMIT_ID = sh(script: "git rev-parse HEAD ", returnStdout: true)
+        COMMIT_SHA = COMMIT_ID.substring(0, 7)
+    }
+
+    env.GIT_COMMIT_ID = COMMIT_ID
+    env.GIT_COMMIT_SHA = COMMIT_SHA
+
+}
+def setGitCredentials(){
+
+    //set Git Global vars
+    sh """
+        git config --global user.name cicd-exotel
+        git config --global user.email cicd@exotel.in
+    """
+}
+//Checkout source repository
+def checkoutSCM() {
+    def repo = checkout scm
+    env.GIT_BRANCH = repo.GIT_BRANCH.replace("origin/", "").trim()
+}
+
+def gitClone(Map args) {
+    def result = checkout([$class: 'GitSCM', branches: [[name: args.branch]], doGenerateSubmoduleConfigurations: false, extensions: [[$class: 'CloneOption', honorRefspec: true, noTags: false, reference: '', shallow: true, timeout: 10]], submoduleCfg: [], userRemoteConfigs: [[credentialsId: args.credential_key, url: args.url]]])
+    return result.GIT_COMMIT
+}
+
+def sparseCheckout(Map args){
+    def result = checkout([$class: 'GitSCM', branches: [[name: args.branch]], doGenerateSubmoduleConfigurations: false, extensions: [[$class: 'SparseCheckoutPaths', sparseCheckoutPaths: args.checkoutPaths], [$class: 'CheckoutOption', timeout: 10], [$class: 'CloneOption', depth: 1, noTags: false, reference: '', shallow: true, timeout: 10]], submoduleCfg: [], userRemoteConfigs: [[credentialsId: 'cicd-exotel', url: args.url]]])
+}
+
+def gitPush(Map args) {
+    sh """
+     #!/usr/bin/env bash
+     set +x 
+     export GIT_SSH_COMMAND="ssh -oStrictHostKeyChecking=no"
+     git pull origin ${args.branch}
+    """
+    def isFilesChanged = sh(script: "git status --porcelain | wc -l ", returnStdout: true)
+    println "Is Files Changed: ${isFilesChanged}"
+    if (isFilesChanged?.trim() != "0" ){
+
+        sh """
+             git add .
+             git commit -m "${args.commit_msg}"
+        """
+        if (args.tag) {
+            sh """git tag ${args.tag}"""
+        }
+        sh """
+            git push -f origin HEAD:${args.branch} --tags
+        """
+    }
+}
+
+return this
+
+---
+
+# /Users/shashidhara.reddy/jenkins-pipeline/src/io/estrado/components/Docker.groovy
+
+package io.estrado.components
+
+//Lints Dockerfile based on Hadolint/hadolint
+def lintDockerfile(String DockerFilePath, String Dockerfile) {
+    if (DockerFilePath?.trim()) {
+        container('builder') {
+            dir(DockerFilePath) {
+                def lintResult = sh(script: "nerdctl run --rm -i hadolint/hadolint < ${Dockerfile}", returnStdout: true)
+            }
+        }
+    } else {
+        throw new Exception("Invalid Dockerfile Path Passed.")
+    }
+}
+
+//Builds docker image
+def imageBuild(String DockerfilePath, String Dockerfile, String overriddenTag) {
+    dir(DockerfilePath) {
+        def dockerEnv = "DOCKER_CONFIG=/root/.dockerhubsecret"
+        if (overriddenTag != ""){
+            def image = sh(script: "${dockerEnv} nerdctl build --no-cache -q -t ${env.ECR_REPO}:latest -f ${Dockerfile} .", returnStdout: true)
+        }else{
+            def image = sh(script: "${dockerEnv} nerdctl build -t ${env.ECR_REPO}:latest -f ${Dockerfile} .", returnStdout: true)
+        }
+    }
+}
+
+def getImageDigest(String ImageName) {
+    try {
+        def repoDigest = sh(script: "nerdctl inspect --format='{{index .RepoDigests 0}}' ${ImageName}", returnStdout: true).trim()
+        if (repoDigest) {
+            return repoDigest.split("@")[1]
+        }
+    } catch (Exception e) {
+        println "Failed to get image digest: ${e.message}"
+    }
+    return ""
+}
+
+//Pushes docker image
+def pushImage() {
+    try {
+        def result = sh(script: "nerdctl push ${env.ECR_REPO}:${env.IMAGE_TAG}", returnStdout: true)
+        return result
+    } catch (Exception e) {
+        println "Failed to push image: ${e.message}"
+        throw e
+    }
+}
+
+def tagImage() {
+    try {
+        if (env.IMAGE_TAG.trim() == "") {
+            //if env.IMAGE_TAG is empty, use default tag 1.0.0.
+            def applyTag = sh(script: "nerdctl tag ${env.ECR_REPO}:latest ${env.ECR_REPO}:1.0.0", returnStdout: true)
+        } else {
+            def applyTag = sh(script: "nerdctl tag ${env.ECR_REPO}:latest ${env.ECR_REPO}:${env.IMAGE_TAG}", returnStdout: true)
+        }
+    } catch (Exception e) {
+        println "Failed to tag image: ${e.message}"
+        throw e
+    }
+}
+
+return this
+
+---
+
+# /Users/shashidhara.reddy/jenkins-pipeline/src/io/estrado/components/Helm.groovy
+
+package io.estrado.components
+
+import com.exotel.Constants
+
+def helmCheckout() {
+    Common common = new Common()
+    parallel exotel_config_checkouts: {
+        sh 'mkdir -p exotel_configs'
+        dir('exotel_configs') {
+            env.CONFIG_COMMIT_SHA = common.gitClone(
+                    url: Constants.EXOTEL_CONFIGS_URL,
+                    branch: 'master',
+                    credential_key: 'cicd-exotel'
+            )
+        }
+    }, exotel_deployments_checkout: {
+        sh 'mkdir -p exotel_deployments'
+        dir('exotel_deployments') {
+            env.CONFIG_COMMIT_SHA = common.gitClone(
+                    url: Constants.EXOTEL_DEPLOYMENT_URL,
+                    branch: 'master',
+                    credential_key: 'cicd-exotel'
+            )
+        }
+    }
+}
+def helmCheckout(String serviceName) {
+    Common common = new Common()
+    parallel exotel_config_checkouts: {
+        sh 'mkdir -p exotel_configs'
+        dir('exotel_configs') {
+            env.CONFIG_COMMIT_SHA = common.gitClone(
+                    url: Constants.EXOTEL_CONFIGS_URL,
+                    branch: 'master',
+                    credential_key: 'cicd-exotel'
+            )
+        }
+    }, exotel_deployments_checkout: {
+
+        sh """
+        mkdir -p ${serviceName}_deployments
+        curl -X POST --user "cicd-exotel:S77xSZp3ZV2hcb3HxGFn" -H "Content-Type: application/json" \
+        https://api.bitbucket.org/2.0/repositories/Exotel/${serviceName}_deployments \
+        -d '{"scm": "git", "is_private": "true", "fork_policy": "no_public_forks" }'
+        """
+        dir("${serviceName}_deployments") {
+            env.CONFIG_COMMIT_SHA = common.gitClone(
+                    url: "git@bitbucket.org:Exotel/${serviceName}_deployments.git",
+                    branch: 'master',
+                    credential_key: 'cicd-exotel'
+            )
+        }
+    }
+}
+
+---
+
+# /Users/shashidhara.reddy/jenkins-pipeline/src/io/estrado/pipelines/DefaultBuildPipeline.groovy
+
+package io.estrado.pipelines
+
+import io.estrado.artifact.Artifactory
+import io.estrado.components.Common
+import io.estrado.components.Docker
+import io.estrado.components.Helm
+
+def Run(Map args) {
+
+    print "executing integration work flow"
+    Artifactory ecr = new Artifactory()
+    Common common = new Common()
+    Docker docker = new Docker()
+    Helm helm = new Helm()
+    def label = common.workerLabel(args.serviceName)
+    def integrationBranch = args.integrationBranch ? args.integrationBranch : "pu"
+    def integrationStage = args.integrationStage ? args.integrationStage : "integration"
+    def qaBranch = args.qaBranch ? args.qaBranch : "next"
+    def exotelConfigBranch = args.exotelConfigBranch ? args.exotelConfigBranch : "pu"
+    def exotelCodeBranch = args.exotelCodeBranch ? args.exotelCodeBranch : "master"
+    def customShellScript = args.customShellScript ? args.customShellScript : ""
+    def defaultRepo = [
+            "repoName"        : "exotel_code",
+            "gitRepoUrl"      : "git@bitbucket.org:Exotel/exotel_code.git",
+            "gitBranch"       : "${exotelCodeBranch}",
+            "gitCredentialKey": "cicd-exotel",
+            "checkoutPath"    : "[[path: 'commonix']]"
+    ]
+    def externalRepo = args.externalRepo ? args.externalRepo : defaultRepo
+
+
+    podTemplate(label: label, namespace: 'infra', serviceAccount: 'jenkins', containers: [
+            containerTemplate(name: 'builder', 
+                        image: 'exotelorg/nerdctl-awscli:v1', 
+                        command: '/bin/sh -c', 
+                        args: 'buildkitd --rootless & sleep 2 && cat', 
+                        ttyEnabled: true, 
+                        privileged: true,
+                        volumeMounts: [mountPath: '/root/.dockerhubsecret', name: 'dockerhub-creds']),
+            containerTemplate(name: 'helm', image: 'exotelorg/k8s-helm', command: 'cat', ttyEnabled: true),
+            containerTemplate(name: 'jdk', image: 'exotelorg/jdk:1.7', command: 'cat', ttyEnabled: true)
+    ], imagePullSecrets: ['exotelorg-dockerhub-secret'], volumes: [
+            hostPathVolume(mountPath: '/run/containerd', hostPath: '/run/containerd'),
+            hostPathVolume(mountPath: '/var/lib/containerd', hostPath: '/var/lib/containerd'),
+            hostPathVolume(mountPath: '/var/lib/nerdctl', hostPath: '/var/lib/nerdctl'),
+            hostPathVolume(mountPath: '/opt/cni/bin', hostPath: '/opt/cni/bin'),
+            hostPathVolume(mountPath: '/etc/cni/net.d', hostPath: '/etc/cni/net.d'),
+            secretVolume(secretName: 'exotelorg-dockerhub-secret', mountPath: '/root/.dockerhubsecret', name: 'dockerhub-creds')
+    ]) {
+        node(label) {
+
+            stage('Code Checkout') {
+                // Checkout the main repo
+                common.checkoutSCM()
+            }
+            stage('Load Git Environment') {
+                //Load default variables
+                common.loadDefaultVariables(args)
+                common.setGitCredentials()
+            }
+
+            if (env.GIT_BRANCH == integrationBranch) {
+
+               
+
+                if (args.buildJars == "true") {
+                    stage('Checkout Remote repository') {
+                        sh "mkdir -p ${externalRepo.get("repoName")}"
+                        dir(externalRepo.get("repoName")) {
+                            env.CONFIG_COMMITID = common.sparseCheckout(
+                                    url: "${externalRepo.get("gitRepoUrl")}",
+                                    branch: "${externalRepo.get("gitBranch")}",
+                                    credential_key: "${externalRepo.get("gitCredentialKey")}",
+                                    checkout_paths: "${externalRepo.get("checkoutPath")}"
+                            )
+                        }
+                    }
+                    stage('custom shell commands in Jdk Container') {
+                        container('jdk') {
+                            if (customShellScript && !customShellScript.isEmpty()) {
+                                customShellScript.each {
+                                    command -> sh(script: "${command}", label: command)
+                                }
+                            }
+                        }
+                    }
+                } else {
+
+                    stage('custom shell commands in Docker container') {
+                        container('builder') {
+                            if (customShellScript && !customShellScript.isEmpty()) {
+                                customShellScript.each {
+                                    command -> sh(script: "${command}", label: command)
+                                }
+                            }
+                        }
+                    }
+                }
+                stage('Basic Checks') {
+                    parallel Lint_Dockerfile: {
+                        stage('Lint Dockerfile') {
+                            container('builder') {
+                                //Lint Dockerfile
+                                docker.lintDockerfile(args.dockerfilePath, args.dockerfile)
+                            }
+                        }
+                    }, Fetch_ECR_Credentials: {
+                        stage('Fetch ECR Credentials') {
+                            container('builder') {
+                                //Get ECR creds
+                                ecr.sourceECRCredentials()
+                            }
+                        }
+                    }
+                }
+                stage('Image Builds') {
+                    parallel Build_Docker_Image: {
+                        stage('Build Docker Image') {
+                            container('builder') {
+                                docker.imageBuild(args.dockerfilePath, args.dockerfile, args.overrideImageTag)
+                                env.SHA_Digest = docker.getImageDigest(env.ECR_REPO)
+                            }
+                        }
+                    }, Fetch_ECR_Image_Digests: {
+                        stage('Get ECR Digests') {
+                            container('builder') {
+                                // Get only last 25 image SHA digests as of now
+                                env.ECR_Digests = ecr.getECRImageDigests(25)
+                            }
+                        }
+                    }
+                }
+                stage('Check for Identical Image') {
+                    //Todo: Athavan Check for existing tags with user's override image tag
+                    // and decide pushing based on that condition too
+                    println env.SHA_Digest
+                    println env.ECR_Digests
+                    env.PUSH_IMAGE = "true"
+                    if (env.ECR_Digests.contains(env.SHA_Digest) && env.SHA_Digest != "") {
+                        def message = "Nothing changed in the Image. Use the Existing Tag in your code"
+                        sh(script: "echo ${message}", label: message)
+                        env.PUSH_IMAGE = "false"
+                    }
+                    println "Tony stark  ${env.PUSH_IMAGE}"
+                }
+
+                println "Tony stark  ${env.PUSH_IMAGE}"
+                if (env.PUSH_IMAGE == "true") {
+                    println "Captain Marvel. Did I enter here ?"
+
+                    stage('Tag Docker Image') {
+                        container('builder') {
+                            env.IMAGE_TAG = ecr.getLatestImageTag()
+                            docker.tagImage()
+                        }
+                    }
+                    stage('Push Docker Image') {
+                        container('builder') {
+                            docker.pushImage()
+                            def message = "Docker image ${env.ECR_REPO}:${env.IMAGE_TAG} pushed successfully"
+                            sh(script: "echo ${message}", label: message)
+                        }
+                    }
+                }
+
+          
+
+            stage('Source code checkouts') {
+                helm.helmCheckout()
+            }
+            stage('Fetch Latest Tag') {
+                container('builder') {
+                    env.NEW_IMAGE_TAG = ecr.getLatestTagForHelm()
+                }
+            }
+            if (env.GIT_BRANCH == integrationBranch) {
+
+                stage('Helm Generation for Integration') {
+                    container("helm") {
+                        dir('exotel_configs') {
+                            common.sparseCheckout(
+                                    url: "git@bitbucket.org:Exotel/exotel_configs.git",
+                                    branch: "${exotelConfigBranch}",
+                                    credential_key: "cicd-exotel"
+                            )
+                        }
+                        sh """
+                        cp exotel_configs/sops-pgp/* ${args.configFilePath}/
+                        """
+                        dir(args.configFilePath) {
+                            sh """
+                            cp -rf k8s/* .
+                            helm template --name ${
+                                args.serviceName
+                            } . -f values/values.${integrationStage}.yaml --set=service_image.tag="${
+                                env.NEW_IMAGE_TAG
+                            }" --set=configs.commit_id="${env.CONFIG_COMMIT_SHA}" --set=service_image.commit_id="${
+                                env.GIT_COMMIT_ID
+                            }" ${args.additionalHelmFlags} > ${args.serviceName}-${integrationStage}.yaml
+                            cat ${args.serviceName}-${integrationStage}.yaml
+                            """
+                        }
+                        sh """
+			    mkdir -p  exotel_deployments/${args.serviceName}/${integrationStage}/
+                            mv ${args.configFilePath}/${args.serviceName}-${integrationStage}.yaml exotel_deployments/${
+                            args.serviceName
+                        }/${integrationStage}/
+                        cat exotel_deployments/${args.serviceName}/${integrationStage}/${args.serviceName}-${integrationStage}.yaml
+                        """
+                    }
+                }
+                stage('Commit PU Deployment Files') {
+                    sshagent(['cicd-exotel']) {
+                        dir("exotel_deployments") {
+                            common.gitPush(
+                                    branch: "master",
+                                    commit_msg: "Update K8s manifests for ${args.serviceName}-${integrationStage}-${env.NEW_IMAGE_TAG}. Service Commit: ${env.GIT_COMMIT_ID}. Configs Commit: ${env.CONFIG_COMMIT_SHA}",
+                                    tag: "${args.serviceName}-${integrationStage}-${env.NEW_IMAGE_TAG}-${label}"
+
+                            )
+                        }
+                    }
+                }
+            }
+            if (env.GIT_BRANCH == "next") {
+
+                stage('Helm Generation for QA') {
+                    container("helm") {
+                        dir('exotel_configs') {
+                            common.sparseCheckout(
+                                    url: "git@bitbucket.org:Exotel/exotel_configs.git",
+                                    branch: "${exotelConfigBranch}",
+                                    credential_key: "cicd-exotel"
+                            )
+                        }
+
+                        sh """
+                        cp exotel_configs/sops-pgp/* ${args.configFilePath}/
+                        """
+                        dir(args.configFilePath) {
+                            sh """
+                            cp -rf k8s/* .
+                            helm template --name ${
+                                args.serviceName
+                            } . -f values/values.qa_us3.yaml --set=service_image.tag="${
+                                env.NEW_IMAGE_TAG
+                            }" --set=configs.commit_id="${env.CONFIG_COMMIT_SHA}" --set=service_image.commit_id="${
+                                env.GIT_COMMIT_ID
+                            }" ${args.additionalHelmFlags} > ${args.serviceName}-qa.yaml
+                            cat ${args.serviceName}-qa.yaml
+                            """
+                        }
+                        sh """
+			    mkdir -p exotel_deployments/${args.serviceName}/qa/
+                            mv ${args.configFilePath}/${args.serviceName}-qa.yaml exotel_deployments/${
+                            args.serviceName
+                        }/qa/
+                        cat exotel_deployments/${args.serviceName}/qa/${args.serviceName}-qa.yaml
+                        """
+                    }
+                }
+                stage('Commit QA Deployment Files') {
+                    sshagent(['cicd-exotel']) {
+                        dir("exotel_deployments") {
+                            common.gitPush(
+                                    branch: "master",
+                                    commit_msg: "Update K8s manifests for ${args.serviceName}-qa-${env.NEW_IMAGE_TAG}. Service Commit: ${env.GIT_COMMIT_ID}. Configs Commit: ${env.CONFIG_COMMIT_SHA}",
+                                    tag: "${args.serviceName}-qa-${env.NEW_IMAGE_TAG}-${label}"
+
+                            )
+                        }
+                    }
+                }
+            }
+            }
+        }
+        // Create Approval for QA
+        if (env.GIT_BRANCH == "next") {
+            println args.qaApprovers
+            timeout(activity: true, time: 5, unit: "DAYS") {
+                env.ApprovalResult = input id: 'UserInput', message: 'Promote to Production Environments ?', ok: 'Approve', submitter: "${args.qaApprovers}", submitterParameter: 'APPROVAL'
+            }
+
+
+            //Prod Generation
+            println "kkkkk ${env.ApprovalResult}"
+            def assignedApprovers = args.qaApprovers.split(",")
+            println "Array ${assignedApprovers}"
+            if (assignedApprovers.contains(env.ApprovalResult)) {
+
+                podTemplate(label: label, namespace: 'infra', serviceAccount: 'jenkins', containers: [
+                        containerTemplate(name: 'builder', 
+                        image: 'exotelorg/nerdctl-awscli:v1', 
+                        command: '/bin/sh -c', 
+                        args: 'buildkitd --rootless & sleep 2 && cat', 
+                        ttyEnabled: true, 
+                        privileged: true,
+                        volumeMounts: [mountPath: '/root/.dockerhubsecret', name: 'dockerhub-creds']),
+                        containerTemplate(name: 'helm', image: 'exotelorg/k8s-helm', command: 'cat', ttyEnabled: true)
+                ], imagePullSecrets: ['exotelorg-dockerhub-secret'], volumes: [
+                        hostPathVolume(mountPath: '/run/containerd', hostPath: '/run/containerd'),
+                        hostPathVolume(mountPath: '/var/lib/containerd', hostPath: '/var/lib/containerd'),
+                        hostPathVolume(mountPath: '/var/lib/nerdctl', hostPath: '/var/lib/nerdctl'),
+                        hostPathVolume(mountPath: '/opt/cni/bin', hostPath: '/opt/cni/bin'),
+                        hostPathVolume(mountPath: '/etc/cni/net.d', hostPath: '/etc/cni/net.d'),
+                        secretVolume(secretName: 'exotelorg-dockerhub-secret', mountPath: '/root/.dockerhubsecret', name: 'dockerhub-creds')
+                ]) {
+                    node(label) {
+                        stage('Source code checkouts') {
+                            helm.helmCheckout()
+                            common.setGitCredentials()
+                        }
+                        stage('Fetch Latest Tag') {
+                            container('builder') {
+                                env.NEW_IMAGE_TAG = ecr.getLatestTagForHelm()
+                            }
+                        }
+                        stage('Helm Generation for Production') {
+
+                            container("helm") {
+                                sh """
+                        cp exotel_configs/sops-pgp/* ${args.configFilePath}/
+                        """
+                                dir(args.configFilePath) {
+                                    sh """
+                            cp -rf k8s/* .
+                            helm template --name ${
+                                        args.serviceName
+                                    } . -f values/values.prod.yaml --set=service_image.tag="${
+                                        env.NEW_IMAGE_TAG
+                                    }" --set=configs.commit_id="${
+                                        env.CONFIG_COMMIT_SHA
+                                    }" --set=service_image.commit_id="${
+                                        env.GIT_COMMIT_ID
+                                    }" ${args.additionalHelmFlags} > ${args.serviceName}-prod.yaml
+
+                            helm template --name ${
+                                        args.serviceName
+                                    } . -f values/values.mum1.yaml --set=service_image.tag="${
+                                        env.NEW_IMAGE_TAG
+                                    }" --set=configs.commit_id="${
+                                        env.CONFIG_COMMIT_SHA
+                                    }" --set=service_image.commit_id="${
+                                        env.GIT_COMMIT_ID
+                                    }" ${args.additionalHelmFlags} > ${args.serviceName}-mum1.yaml
+
+
+                            cat ${args.serviceName}-mum1.yaml
+                            """
+                                }
+
+                                sh """
+                            mkdir -p  exotel_deployments/${args.serviceName}/prod/
+                            mkdir -p  exotel_deployments/${args.serviceName}/mum1/
+                            mv ${args.configFilePath}/${args.serviceName}-prod.yaml exotel_deployments/${
+                                    args.serviceName
+                                }/prod/
+                            mv ${args.configFilePath}/${args.serviceName}-mum1.yaml exotel_deployments/${
+                                    args.serviceName
+                                }/mum1/
+                        """
+                            }
+                        }
+
+                        stage('Commit Production Deployment Files') {
+                            sshagent(['cicd-exotel']) {
+                                dir("exotel_deployments") {
+                                    common.gitPush(
+                                            branch: "master",
+                                            commit_msg: "Update K8s manifests for ${args.serviceName}-production-${env.NEW_IMAGE_TAG}. Service Commit: ${env.GIT_COMMIT_ID}. Configs Commit: ${env.CONFIG_COMMIT_SHA}",
+                                            tag: "${args.serviceName}-production-${env.NEW_IMAGE_TAG}-${label}"
+
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+}
+
+---
+
+# /Users/shashidhara.reddy/jenkins-pipeline/src/io/estrado/pipelines/DefaultHelmPipeline.groovy
+
+package io.estrado.pipelines
+
+import io.estrado.artifact.Artifactory
+import io.estrado.components.Common
+import io.estrado.components.Docker
+import io.estrado.components.Helm
+
+
+def CreateDeploymentFile(Map args) {
+
+    Artifactory ecr = new Artifactory()
+    Common common = new Common()
+    Docker docker = new Docker()
+    Helm helm = new Helm()
+    def integrationStage = args.integrationStage ? args.integrationStage : "integration"
+
+    def label = common.workerLabel(args.serviceName)
+
+    podTemplate(label: label, namespace: 'infra', serviceAccount: 'jenkins', containers: [
+            containerTemplate(name: 'builder', 
+                        image: 'exotelorg/nerdctl-awscli:v1', 
+                        command: '/bin/sh -c', 
+                        args: 'buildkitd --rootless & sleep 2 && cat', 
+                        ttyEnabled: true, 
+                        privileged: true,
+                        volumeMounts: [mountPath: '/root/.dockerhubsecret', name: 'dockerhub-creds']),
+            containerTemplate(name: 'helm', image: 'exotelorg/k8s-helm', command: 'cat', ttyEnabled: true)
+    ], imagePullSecrets: ['exotelorg-dockerhub-secret'], volumes: [
+            hostPathVolume(mountPath: '/run/containerd', hostPath: '/run/containerd'),
+            hostPathVolume(mountPath: '/var/lib/containerd', hostPath: '/var/lib/containerd'),
+            hostPathVolume(mountPath: '/var/lib/nerdctl', hostPath: '/var/lib/nerdctl'),
+            hostPathVolume(mountPath: '/opt/cni/bin', hostPath: '/opt/cni/bin'),
+            hostPathVolume(mountPath: '/etc/cni/net.d', hostPath: '/etc/cni/net.d'),
+            secretVolume(secretName: 'exotelorg-dockerhub-secret', mountPath: '/root/.dockerhubsecret', name: 'dockerhub-creds')
+    ]) {
+        node(label) {
+
+            stage('Code Checkout') {
+                // Checkout the main repo
+                common.checkoutSCM()
+            }
+            stage('Load Git Environment') {
+                //Load default variables
+                common.loadDefaultVariables(args)
+                common.setGitCredentials()
+            }
+            if (env.GIT_BRANCH == "master" || env.GIT_BRANCH == "next"){
+                stage("Lint Helm Chart"){
+                    container("helm"){
+                        println "Running Helm lint"
+                        sh """
+                            helm lint ${args.chartDir}
+                        """
+                    }
+                }
+                stage("Fetch Latest Image Tag"){
+                    container('builder') {
+                        env.NEW_IMAGE_TAG = ecr.getLatestTagForHelm()
+                    }
+                }
+                stage("Generate Helm Files"){
+                    sh """
+                        cp -rf sops-pgp/* ${args.configPath}/
+                        cp -rf ${args.chartDir}/* {$args.configPath}/
+
+                    """
+                    println args.extraConfigPaths
+                    if (!args.extraConfigPaths.isEmpty()) {
+                        for (item in args.extraConfigPaths) {
+                            sh """
+                                    cp ${item}/* ${args.configFilePath}/
+                                """
+                        }
+                    }
+                    dir(args.configPath){
+                        parallel Helm_Generation_Integration: {
+                            stage('Helm for Integration'){
+                                container("helm"){
+                                    sh """
+                                        helm template --name ${args.serviceName} -f values/values.${integrationStage}.yaml --set=service_image.tag="${env.NEW_IMAGE_TAG}" --set=configs.commit_id="${env.GIT_COMMIT_ID}" ${args.additionalHelmFlags} > ${args.serviceName}-${integrationStage}.yaml
+                                        cat ${args.serviceName}-${integrationStage}.yaml
+
+                                    """
+                                }
+                            }
+                        }, Helm_Generation_QA: {
+
+                            stage('Helm for QA'){
+                                container("helm"){
+                                    sh """
+                                        helm template --name ${args.serviceName} -f values/values.qa_us3.yaml --set=service_image.tag="${env.NEW_IMAGE_TAG}" --set=configs.commit_id="${env.GIT_COMMIT_ID}" ${args.additionalHelmFlags} > ${args.serviceName}-qa_us3.yaml
+                                        cat ${args.serviceName}-qa_us3.yaml
+
+                                    """
+                                }
+                            }
+                        }, Helm_Generation_Prod: {
+
+                            stage('Helm for Prod Singapore'){
+                                container("helm"){
+                                    sh """
+                                        helm template --name ${args.serviceName} -f values/values.prod.yaml --set=service_image.tag="${env.NEW_IMAGE_TAG}" --set=configs.commit_id="${env.GIT_COMMIT_ID}" ${args.additionalHelmFlags} > ${args.serviceName}-prod.yaml
+                                        cat ${args.serviceName}-prod.yaml
+
+                                    """
+                                }
+                            }
+                        }, Helm_Generation_Mumbai: {
+
+                            stage('Helm for Mum1'){
+                                container("helm"){
+                                    sh """
+                                        helm template --name ${args.serviceName} -f values/values.mum1.yaml --set=service_image.tag="${env.NEW_IMAGE_TAG}" --set=configs.commit_id="${env.GIT_COMMIT_ID}" ${args.additionalHelmFlags} > ${args.serviceName}-mum1.yaml
+                                        cat ${args.serviceName}-mum1.yaml
+
+                                    """
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+---
+
+# /Users/shashidhara.reddy/jenkins-pipeline/src/io/estrado/pipelines/DefaultJavaPipeline.groovy
+
+package io.estrado.pipelines
+
+import io.estrado.artifact.Artifactory
+import io.estrado.components.Common
+import io.estrado.components.Docker
+import io.estrado.components.Helm
+
+import com.exotel.Constants
+import com.exotel.JenkinsPipelineSteps
+import com.exotel.CommonWorkflowSteps
+import com.exotel.ProdWorkflow
+import com.exotel.DevboxWorkFlow
+
+def Run(Map args) {
+    Common common = new Common()
+    ProdWorkflow prodWorkflow = new ProdWorkflow()
+    DevboxWorkFlow devboxWorkFlow = new DevboxWorkFlow()
+
+    def pipelineMap = [: ]
+    pipelineStep = new JenkinsPipelineSteps()
+    pipelineStep.readEnvironmentVariable(args)
+    CommonWorkflowSteps commonWorkflowStep = new CommonWorkflowSteps()
+
+    print(args.deployRepo)
+    label = pipelineStep.getWorkerLabel(args.serviceName)
+    // These defaults can cause problems since it's not always pu/next, some applications also have
+    // proposedupdates and nextrelease, so the best approach is to define mandatory params and fail build
+    // if they are not present
+    args.integrationBranch = args.integrationBranch ? args.integrationBranch : 'pu'
+    args.deployRepo = args.deployRepo ? args.deployRepo : 'pu'
+    args.qaBranch = args.qaBranch ? args.qaBranch : 'next'
+    args.exotelCodeBranch = args.exotelCodeBranch ? args.exotelCodeBranch : 'master'
+    def DEFAULT_JDK_IMAGE = 'exotelorg/jdk:8'
+    jdkContainerImage = args.jdkContainerImage?.trim() ?: DEFAULT_JDK_IMAGE
+    echo "Selected JDK Container Image: ${jdkContainerImage}"
+
+    def jdkVersion = args.jdkVersion ?: '8'
+
+    if (jdkVersion == '21') {
+        jdkContainerImage = 'public.ecr.aws/m8j6m5q1/exotelorg/java:21'
+        mavenCacheName = 'maven-repo-jdk17'  // Same Maven version as JDK 17
+        echo "Using JDK ${jdkVersion} (${jdkContainerImage}) with cache: ${mavenCacheName}"
+    } else if (jdkVersion == '17') {
+        jdkContainerImage = 'public.ecr.aws/m8j6m5q1/exotelorg/java:396'
+        mavenCacheName = 'maven-repo-jdk17'  // Same Maven version as JDK 21
+        echo "Using JDK ${jdkVersion} (${jdkContainerImage}) with cache: ${mavenCacheName}"
+    } else if (jdkVersion == '8') {
+        jdkContainerImage = 'exotelorg/jdk:8'
+        mavenCacheName = 'maven-repo'
+        echo "Using JDK ${jdkVersion} (${jdkContainerImage}) with cache: ${mavenCacheName}"
+    } else {
+        // Fallback to default
+        echo "Using Default JDK version ${jdkVersion} (${jdkContainerImage}) with cache: ${mavenCacheName}"
+    }
+
+    args.downloadExotelCode = args.downloadExotelCode ? args.downloadExotelCode : 'true'
+    enableMavenCache = args.enableMavenCache ? args.enableMavenCache : 'false'
+    mavenCacheName = args.mavenCacheName ? args.mavenCacheName : 'maven-repo'
+    args.useServiceDeploymentRepo = args.useServiceDeploymentRepo ? args.useServiceDeploymentRepo : 'false'
+    // Maven-specific parameters
+    args.mavenGoals = args.mavenGoals ? args.mavenGoals : "clean package"
+    args.mavenProfiles = args.mavenProfiles ? args.mavenProfiles : "with-telemetrix"
+    args.skipTests = args.skipTests ? args.skipTests : "true"
+    args.mavenOptions = args.mavenOptions ? args.mavenOptions : ""
+    //args.integrationStage = args.integrationStage ? args.integrationStage : Constants.INTEGRATION_STAGE
+    println(args.integrationStage)
+println("Integration stage")
+     if (env.STAMP) {
+        args.integrationStage = env.STAMP
+        println(args.integrationStage)
+
+        println(env.STAMP)
+    }
+    if (env.buildtype) {
+        args.deployRepo = env.buildtype
+    }
+
+    // 'volumes' list is eventually flattened because it can evaluate with empty sub-arrays under certain conditions.
+    podTemplate(label: label, namespace: 'infra', serviceAccount: 'jenkins', containers: [
+        containerTemplate(name: 'builder', 
+                        image: 'exotelorg/nerdctl-awscli:v1', 
+                        command: '/bin/sh -c', 
+                        args: 'buildkitd --rootless & sleep 2 && cat', 
+                        ttyEnabled: true, 
+                        privileged: true,
+                        volumeMounts: [mountPath: '/root/.dockerhubsecret', name: 'dockerhub-creds']),
+        containerTemplate(name: 'helm', image: 'exotelorg/k8s-helm', command: 'cat', ttyEnabled: true),
+        containerTemplate(name: 'jdk', image: jdkContainerImage, command: 'cat', ttyEnabled: true),
+    ], imagePullSecrets: ['exotelorg-dockerhub-secret'], volumes: [
+        hostPathVolume(mountPath: '/run/containerd', hostPath: '/run/containerd'),
+        hostPathVolume(mountPath: '/var/lib/containerd', hostPath: '/var/lib/containerd'),
+        hostPathVolume(mountPath: '/var/lib/nerdctl', hostPath: '/var/lib/nerdctl'),
+        hostPathVolume(mountPath: '/opt/cni/bin', hostPath: '/opt/cni/bin'),
+        hostPathVolume(mountPath: '/etc/cni/net.d', hostPath: '/etc/cni/net.d'),
+        secretVolume(secretName: 'exotelorg-dockerhub-secret', mountPath: '/root/.dockerhubsecret', name: 'dockerhub-creds'),
+        (enableMavenCache == 'true' ?
+            persistentVolumeClaim(mountPath: '/root/.m2/repository', claimName: mavenCacheName, readOnly: false) : [])
+    ].flatten()) {
+        node(label) {
+            pipelineStep.initialize()
+            // Checkout the main repo
+
+            if (args.downloadExotelCode == 'true') {
+                args.exotelCodePaths = ['commonix']
+            }
+
+            commonWorkflowStep.cloneCodeRepos(pipelineStep, pipelineMap, args)
+
+            if (args.buildEnv != Constants.DEVBOX_STAGE) {
+                commonWorkflowStep.cloneExotelDeploymentsRepo(pipelineStep, args)
+            }
+
+            stage('Load Git Environment') {
+                // Load default variables
+                common.loadDefaultVariables(args)
+            }
+
+            if (args.buildJars == 'true' && pipelineMap.scmBranch != args.qaBranch) {
+                commonWorkflowStep.buildJars(args)
+            }
+
+            commonWorkflowStep.lintDockerfile(args)
+
+            if (args.buildEnv == Constants.DEVBOX_STAGE) {
+                devboxWorkFlow.Init(args)
+                return
+            }
+            
+            echo "DEBUG: pipelineMap.scmBranch = ${pipelineMap.scmBranch}"
+            echo "DEBUG: args.integrationBranch = ${args.integrationBranch}"
+            echo "DEBUG: args.qaBranch = ${args.qaBranch}"
+            
+            if (pipelineMap.scmBranch == args.integrationBranch) {
+                echo "DEBUG: Running integration stage for branch: ${pipelineMap.scmBranch}"
+            
+            if(args.integrationBranch == 'pu' || args.integrationBranch == 'proposedupdates') {
+                commonWorkflowStep.computeGitCommits(pipelineStep, pipelineMap, args)
+                }
+
+
+                commonWorkflowStep.imageBuildPreChecks(pipelineStep, pipelineMap, args)
+
+                if (pipelineMap.shouldBuildDockerImage) {
+                    commonWorkflowStep.increamentImageVersion(pipelineStep, pipelineMap)
+                    commonWorkflowStep.buildAndPushDockerImage(pipelineStep, pipelineMap, args)
+                }
+
+                if (args.enableCanary) {
+                    pipelineStep.copyLatestStableFiles(args, args.integrationStage)
+                }
+                commonWorkflowStep.generateHelmForStage(pipelineStep, pipelineMap, args, args.integrationStage)
+                commonWorkflowStep.commitDeploymentFilesForTheStage(pipelineStep, pipelineMap, args, args.integrationStage)
+                pipelineStep.printBuildInfo(pipelineMap, args)
+                
+            }
+        }
+
+        // Create Approval for QA and Production
+        echo "DEBUG: Checking QA branch condition: pipelineMap.scmBranch (${pipelineMap.scmBranch}) == args.qaBranch (${args.qaBranch})"
+        if (pipelineMap.scmBranch == args.qaBranch) {
+            echo "DEBUG: Running QA stage for branch: ${pipelineMap.scmBranch}"
+            println args.qaApprovers
+            timeout(activity: true, time: 5, unit: 'DAYS') {
+                env.ApprovalResult = input id: 'UserInput', message: 'Promote to QA and Production Environments ?', ok: 'Approve', submitter: "${args.qaApprovers}", submitterParameter: 'APPROVAL'
+            }
+
+            //QA and Production Generation
+            println "Approvers list ${env.ApprovalResult}"
+            def assignedApprovers = args.qaApprovers.split(',')
+            println "Array ${assignedApprovers}"
+            if (assignedApprovers.contains(env.ApprovalResult)) {
+                podTemplate(label: label, namespace: 'infra', serviceAccount: 'jenkins', containers: [
+                    containerTemplate(name: 'builder', 
+                        image: 'exotelorg/nerdctl-awscli:v1', 
+                        command: '/bin/sh -c', 
+                        args: 'buildkitd --rootless & sleep 2 && cat', 
+                        ttyEnabled: true, 
+                        privileged: true, 
+                        volumeMounts: [mountPath: '/root/.dockerhubsecret', name: 'dockerhub-creds']),
+                    containerTemplate(name: 'helm', image: 'exotelorg/k8s-helm', command: 'cat', ttyEnabled: true)
+                ], imagePullSecrets: ['exotelorg-dockerhub-secret'], volumes: [
+                    hostPathVolume(mountPath: '/run/containerd', hostPath: '/run/containerd'),
+                    hostPathVolume(mountPath: '/var/lib/containerd', hostPath: '/var/lib/containerd'),
+                    hostPathVolume(mountPath: '/var/lib/nerdctl', hostPath: '/var/lib/nerdctl'),
+                    hostPathVolume(mountPath: '/opt/cni/bin', hostPath: '/opt/cni/bin'),
+                    hostPathVolume(mountPath: '/etc/cni/net.d', hostPath: '/etc/cni/net.d'),
+                    secretVolume(secretName: 'exotelorg-dockerhub-secret', mountPath: '/root/.dockerhubsecret', name: 'dockerhub-creds')
+                ]) {
+                    node(label) {
+                        pipelineStep.initialize()
+                        commonWorkflowStep.cloneCodeRepos(pipelineStep, pipelineMap, args)
+                        commonWorkflowStep.cloneExotelDeploymentsRepo(pipelineStep, args)
+                        
+                        // Generate QA deployment
+                        commonWorkflowStep.generateHelmForStage(pipelineStep, pipelineMap, args, 'qa')
+                        commonWorkflowStep.commitDeploymentFilesForTheStage(pipelineStep, pipelineMap, args, 'qa')
+                        
+                        // Generate Production deployments (prod and mum1)
+                        prodWorkflow.Init(args)
+                    }
+                }
+            }
+        }
+    }
+}
+
+---
+
+# /Users/shashidhara.reddy/jenkins-pipeline/src/io/estrado/pipelines/DefaultReactPipeline.groovy
+
+package io.estrado.pipelines
+
+import io.estrado.artifact.Artifactory
+import io.estrado.components.Common
+import io.estrado.components.Docker
+import io.estrado.components.Helm
+import com.exotel.JenkinsPipelineSteps
+
+def Run(Map args) {
+    print "executing React application pipeline"
+    Artifactory ecr = new Artifactory()
+    Common common = new Common()
+    Docker docker = new Docker()
+    Helm helm = new Helm()
+    JenkinsPipelineSteps pipelineStep = new JenkinsPipelineSteps()
+    def label = common.workerLabel(args.serviceName)
+    def integrationBranch = args.integrationBranch ? args.integrationBranch : "pu"
+    def integrationStage = args.integrationStage ? args.integrationStage : "integration"
+    def qaBranch = args.qaBranch ? args.qaBranch : "next"
+    
+    // Dynamic branch detection based on trigger branch
+    def currentPipelineBranch = env.GIT_BRANCH?.replace('origin/', '')?.trim() ?: env.BRANCH_NAME
+    def originalExotelConfigBranch = args.exotelConfigBranch
+    if (currentPipelineBranch == 'pu' || currentPipelineBranch == 'pu' || currentPipelineBranch == 'proposedupdates' || currentPipelineBranch == 'cqa_pu') {
+        args.exotelConfigBranch = 'pu'  // ← Always clone exotel_configs from 'pu' branch
+    } else if (currentPipelineBranch == 'next' || currentPipelineBranch == 'next' || currentPipelineBranch == 'nextrelease' || currentPipelineBranch == 'cqa_next') {
+        args.exotelConfigBranch = 'next'  // ← Always clone exotel_configs from 'next' branch
+    } else if (currentPipelineBranch == 'master' || currentPipelineBranch == 'cqa_master') {
+        args.exotelConfigBranch = 'master'
+    } else {
+        args.exotelConfigBranch = args.exotelConfigBranch ? args.exotelConfigBranch : 'pu'  // Fallback to parameter or default
+    }
+    echo "Overriding exotelConfigBranch from '${originalExotelConfigBranch}' to '${args.exotelConfigBranch}' based on pipeline branch: ${currentPipelineBranch}"
+    
+    def exotelCodeBranch = args.exotelCodeBranch ? args.exotelCodeBranch : "master"
+    def customShellScript = args.customShellScript ? args.customShellScript : ""
+    
+    // React-specific parameters
+    def nodeVersion = args.nodeVersion ? args.nodeVersion : "18"
+    def npmRegistry = args.npmRegistry ? args.npmRegistry : "https://registry.npmjs.org/"
+    def npmToken = args.npmToken ? args.npmToken : ""
+    def buildCommand = args.buildCommand ? args.buildCommand : "npm run build"
+    def testCommand = args.testCommand ? args.testCommand : "npm test"
+    def installCommand = args.installCommand ? args.installCommand : "npm ci"
+    def runTests = args.runTests ? args.runTests : "true"
+    def buildOutputDir = args.buildOutputDir ? args.buildOutputDir : "build"
+    
+    def defaultRepo = [
+            "repoName"        : "exotel_code",
+            "gitRepoUrl"      : "git@bitbucket.org:Exotel/exotel_code.git",
+            "gitBranch"       : "${exotelCodeBranch}",
+            "gitCredentialKey": "cicd-exotel",
+            "checkoutPath"    : "[[path: 'commonix']]"
+    ]
+    def externalRepo = args.externalRepo ? args.externalRepo : defaultRepo
+    
+    // Dynamic branch detection for external repository (vegaops)
+    if (args.externalRepo && args.externalRepo.gitBranch) {
+        def originalExternalBranch = args.externalRepo.gitBranch
+        if (currentPipelineBranch == 'pu' || currentPipelineBranch == 'pu' || currentPipelineBranch == 'proposedupdates' || currentPipelineBranch == 'cqa_pu') {
+            args.externalRepo.gitBranch = 'pu'
+        } else if (currentPipelineBranch == 'next' || currentPipelineBranch == 'next' || currentPipelineBranch == 'nextrelease' || currentPipelineBranch == 'cqa_next') {
+            args.externalRepo.gitBranch = 'next'
+        } else if (currentPipelineBranch == 'master' || currentPipelineBranch == 'cqa_master') {
+            args.externalRepo.gitBranch = 'master'
+        }
+        if (originalExternalBranch != args.externalRepo.gitBranch) {
+            echo "Overriding external repo branch from '${originalExternalBranch}' to '${args.externalRepo.gitBranch}' based on pipeline branch: ${currentPipelineBranch}"
+        }
+    }
+
+    podTemplate(label: label, namespace: 'infra', serviceAccount: 'jenkins', containers: [
+            containerTemplate(name: 'builder', 
+                        image: 'exotelorg/nerdctl-awscli:v1', 
+                        command: '/bin/sh -c', 
+                        args: 'buildkitd --rootless & sleep 2 && cat', 
+                        ttyEnabled: true, 
+                        privileged: true,
+                        volumeMounts: [mountPath: '/root/.dockerhubsecret', name: 'dockerhub-creds']),
+            containerTemplate(name: 'helm', image: 'exotelorg/k8s-helm', command: 'cat', ttyEnabled: true),
+            containerTemplate(name: 'nodejs', 
+                        image: "node:${nodeVersion}-alpine", 
+                        command: 'cat', 
+                        ttyEnabled: true,
+                        volumeMounts: [mountPath: '/root/.npm', name: 'npm-cache'])
+    ], imagePullSecrets: ['exotelorg-dockerhub-secret'], volumes: [
+            hostPathVolume(mountPath: '/run/containerd', hostPath: '/run/containerd'),
+            hostPathVolume(mountPath: '/var/lib/containerd', hostPath: '/var/lib/containerd'),
+            hostPathVolume(mountPath: '/var/lib/nerdctl', hostPath: '/var/lib/nerdctl'),
+            hostPathVolume(mountPath: '/opt/cni/bin', hostPath: '/opt/cni/bin'),
+            hostPathVolume(mountPath: '/etc/cni/net.d', hostPath: '/etc/cni/net.d'),
+            secretVolume(secretName: 'exotelorg-dockerhub-secret', mountPath: '/root/.dockerhubsecret', name: 'dockerhub-creds'),
+            persistentVolumeClaim(mountPath: '/root/.npm', claimName: 'npm-cache', readOnly: false)
+    ]) {
+        node(label) {
+
+            stage('Code Checkout') {
+                // Checkout the main repo
+                common.checkoutSCM()
+            }
+            stage('Load Git Environment') {
+                //Load default variables
+                common.loadDefaultVariables(args)
+                common.setGitCredentials()
+            }
+
+            // Debug: Print branch information
+            echo "DEBUG: env.GIT_BRANCH = ${env.GIT_BRANCH}"
+            echo "DEBUG: integrationBranch = ${integrationBranch}"
+            echo "DEBUG: qaBranch = ${qaBranch}"
+            
+            if (env.GIT_BRANCH == "pu" || env.GIT_BRANCH == "next") {
+
+                // Set basic environment variables
+                def currentCommit = sh(returnStdout: true, script: "git rev-parse HEAD").trim()
+                env.GIT_COMMIT_ID = currentCommit.substring(0, 7)
+                env.CONFIG_COMMIT_SHA = "unknown"
+                env.MD5_OF_MERGE = "react-${currentCommit.substring(0, 7)}-${System.currentTimeMillis()}"
+                env.COMMIT_ID = currentCommit.substring(0, 7)
+                
+                echo "Current commit: ${currentCommit}"
+                echo "Current branch: ${env.GIT_BRANCH}"
+                echo "Will build new image for React application"
+                    stage('Checkout Remote repository') {
+                    // Debug: Print credential information
+                    echo "DEBUG: Using credential key: ${externalRepo.get("gitCredentialKey")}"
+                    echo "DEBUG: Repository URL: ${externalRepo.get("gitRepoUrl")}"
+                    echo "DEBUG: Branch: ${externalRepo.get("gitBranch")}"
+                    echo "DEBUG: Checkout path: ${externalRepo.get("checkoutPath")}"
+                    
+                    sh "mkdir -p ${externalRepo.get("repoName")}"
+                    dir(externalRepo.get("repoName")) {
+                        // Use the same pattern as Java pipeline
+                        if (externalRepo.get("gitCredentialKey") == "vegaops-pat-token") {
+                            // For vegaops repos, use checkoutVegaops method (like Java pipeline)
+                            echo "Using vegaops checkout method for: ${externalRepo.get("gitRepoUrl")}"
+                            env.CONFIG_COMMITID = pipelineStep.checkoutVegaops(
+                                externalRepo.get("gitRepoUrl"), 
+                                externalRepo.get("gitBranch")
+                            )
+                        } else {
+                            // For other repos (exotel_configs), use sparseCheckout method
+                            echo "Using sparseCheckout method for: ${externalRepo.get("gitRepoUrl")}"
+                            env.CONFIG_COMMITID = common.sparseCheckout(
+                                url: "${externalRepo.get("gitRepoUrl")}",
+                                branch: "${externalRepo.get("gitBranch")}",
+                                credential_key: "${externalRepo.get("gitCredentialKey")}",
+                                checkout_paths: "${externalRepo.get("checkoutPath")}"
+                            )
+                        }
+                    }
+                }
+
+                stage('React Application Build') {
+                    container('nodejs') {
+                        // Only run custom shell commands (environment setup)
+                        if (customShellScript && !customShellScript.isEmpty()) {
+                            customShellScript.each {
+                                command -> sh(script: "${command}", label: command)
+                            }
+                        }
+                        
+                        echo "React build will be handled by Dockerfile during Docker build stage"
+                    }
+                }
+
+                stage('Custom Shell Commands') {
+                    container('nodejs') {
+                        if (customShellScript && !customShellScript.isEmpty()) {
+                            customShellScript.each {
+                                command -> sh(script: "${command}", label: command)
+                            }
+                        }
+                    }
+                }
+
+                stage('Basic Checks') {
+                    parallel Lint_Dockerfile: {
+                        stage('Lint Dockerfile') {
+                            container('builder') {
+                                //Lint Dockerfile
+                                docker.lintDockerfile(args.dockerfilePath, args.dockerfile)
+                            }
+                        }
+                    }, Fetch_ECR_Credentials: {
+                        stage('Fetch ECR Credentials') {
+                            container('builder') {
+                                //Get ECR creds
+                                ecr.sourceECRCredentials()
+                            }
+                        }
+                    }
+                }
+                stage('Image Builds') {
+                    parallel Build_Docker_Image: {
+                        stage('Build Docker Image') {
+                            container('builder') {
+                                docker.imageBuild(args.dockerfilePath, args.dockerfile, args.overrideImageTag)
+                                env.SHA_Digest = docker.getImageDigest(env.ECR_REPO)
+                            }
+                        }
+                    }, Fetch_ECR_Image_Digests: {
+                        stage('Get ECR Digests') {
+                            container('builder') {
+                                // Get only last 25 image SHA digests as of now
+                                env.ECR_Digests = ecr.getECRImageDigests(25)
+                            }
+                        }
+                    }
+                }
+                stage('Check for Identical Image') {
+                    //Todo: Athavan Check for existing tags with user's override image tag
+                    // and decide pushing based on that condition too
+                    println env.SHA_Digest
+                    println env.ECR_Digests
+                    env.PUSH_IMAGE = "true"
+                    if (env.ECR_Digests.contains(env.SHA_Digest) && env.SHA_Digest != "") {
+                        def message = "Nothing changed in the Image. Use the Existing Tag in your code"
+                        sh(script: "echo ${message}", label: message)
+                        env.PUSH_IMAGE = "false"
+                    }
+                    println "Tony stark  ${env.PUSH_IMAGE}"
+                }
+
+                println "Tony stark  ${env.PUSH_IMAGE}"
+                if (env.PUSH_IMAGE == "true") {
+                    println "Captain Marvel. Did I enter here ?"
+
+                    stage('Tag Docker Image') {
+                        container('builder') {
+                            env.IMAGE_TAG = ecr.getLatestImageTag()
+                            docker.tagImage()
+                        }
+                    }
+                    stage('Push Docker Image') {
+                        container('builder') {
+                            docker.pushImage()
+                            def message = "Docker image ${env.ECR_REPO}:${env.IMAGE_TAG} pushed successfully"
+                            sh(script: "echo ${message}", label: message)
+                        }
+                    }
+                }
+
+                stage('Source code checkouts') {
+                    helm.helmCheckout()
+                }
+                stage('Fetch Latest Tag') {
+                    container('builder') {
+                        echo "DEBUG: Before getLatestImageTag() - env.IMAGE_TAG = ${env.IMAGE_TAG}"
+                        env.NEW_IMAGE_TAG = ecr.getLatestImageTag()
+                        echo "DEBUG: After getLatestImageTag() - env.NEW_IMAGE_TAG = ${env.NEW_IMAGE_TAG}"
+                    }
+                }
+            if (env.GIT_BRANCH == "pu") {
+
+                stage('Helm Generation for Integration') {
+                    container("helm") {
+                        dir('exotel_configs') {
+                            echo "DEBUG: Cloning exotel_configs repository for Integration"
+                            echo "DEBUG: Repository URL: git@bitbucket.org:Exotel/exotel_configs.git"
+                            echo "DEBUG: Branch: ${args.exotelConfigBranch}"
+                            echo "DEBUG: Credential: cicd-exotel"
+                            common.sparseCheckout(
+                                    url: "git@bitbucket.org:Exotel/exotel_configs.git",
+                                    branch: "${args.exotelConfigBranch}",
+                                    credential_key: "cicd-exotel"
+                            )
+                            echo "DEBUG: Successfully cloned exotel_configs from branch: ${args.exotelConfigBranch}"
+                        }
+                        dir(args.configFilePath) {
+                            sh """
+                            echo "DEBUG: Current directory: \$(pwd)"
+                            echo "DEBUG: Contents of current directory:"
+                            ls -la
+                            echo "DEBUG: Checking for k8s directory:"
+                            ls -la k8s/ || echo "k8s directory not found"
+                            echo "DEBUG: Checking if we're in the right directory:"
+                            pwd
+                            echo "DEBUG: Parent directory contents:"
+                            ls -la ../
+                            echo "DEBUG: Checking for k8s/values directory:"
+                            ls -la k8s/values/ || echo "k8s/values directory not found"
+                            echo "DEBUG: Checking for values files:"
+                            ls -la k8s/values/*.yaml || echo "No yaml files found in k8s/values/"
+                            echo "DEBUG: Copying k8s contents to current directory..."
+                            cp -rf k8s/* .
+                            echo "DEBUG: Contents after copying:"
+                            ls -la
+                            echo "DEBUG: Using image tag for Helm: ${env.NEW_IMAGE_TAG}"
+                            echo "DEBUG: Full helm command:"
+                            echo "helm template --name ${args.serviceName} . -f values/values.${integrationStage}.yaml --set=image.tag=\"${env.NEW_IMAGE_TAG}\" --set=configs.commit_id=\"${env.CONFIG_COMMIT_SHA}\" --set=service_image.commit_id=\"${env.GIT_COMMIT_ID}\" ${args.additionalHelmFlags}"
+                            
+                            echo "DEBUG: Checking values file before helm generation:"
+                            cat values/values.${integrationStage}.yaml | grep -A 5 -B 5 service_image || echo "No service_image found in values file"
+                            
+                            echo "DEBUG: Checking if Helm chart templates exist:"
+                            ls -la templates/ || echo "No templates directory found"
+                            echo "DEBUG: Looking for deployment.yaml template:"
+                            find . -name "deployment.yaml" -o -name "*.yaml" | head -10
+                            
+                            echo "DEBUG: Checking Helm chart structure:"
+                            ls -la
+                            echo "DEBUG: Checking Chart.yaml:"
+                            cat Chart.yaml || echo "No Chart.yaml found"
+                            
+                            helm template --name ${
+                                args.serviceName
+                            } . -f values/values.${integrationStage}.yaml --set=image.tag="${
+                                env.NEW_IMAGE_TAG
+                            }" --set=configs.commit_id="${env.CONFIG_COMMIT_SHA}" --set=service_image.commit_id="${
+                                env.GIT_COMMIT_ID
+                            }" ${args.additionalHelmFlags} > ${args.serviceName}-${integrationStage}.yaml
+                            
+                            echo "DEBUG: Checking generated YAML for image tag:"
+                            cat ${args.serviceName}-${integrationStage}.yaml | grep -A 2 -B 2 image: || echo "No image found in generated YAML"
+                            
+                            echo "DEBUG: Full generated YAML content:"
+                            cat ${args.serviceName}-${integrationStage}.yaml
+                            
+                            echo "DEBUG: Testing Helm template with dry-run to see what values are being used:"
+                            helm template --name ${args.serviceName} . -f values/values.${integrationStage}.yaml --set=image.tag="${env.NEW_IMAGE_TAG}" --set=configs.commit_id="${env.CONFIG_COMMIT_SHA}" --set=service_image.commit_id="${env.GIT_COMMIT_ID}" ${args.additionalHelmFlags} --debug 2>&1 | head -50
+                            """
+                        }
+                        sh """
+			    mkdir -p  exotel_deployments/${args.serviceName}/${integrationStage}/
+                            mv ${args.configFilePath}/${args.serviceName}-${integrationStage}.yaml exotel_deployments/${
+                            args.serviceName
+                        }/${integrationStage}/
+                        cat exotel_deployments/${args.serviceName}/${integrationStage}/${args.serviceName}-${integrationStage}.yaml
+                        """
+                    }
+                }
+                stage('Commit PU Deployment Files') {
+                    sshagent(['cicd-exotel']) {
+                        dir("exotel_deployments") {
+                            // Use simple tagging
+                            def gitTag = "${args.serviceName}-${env.NEW_IMAGE_TAG}-${env.COMMIT_ID}-${label}"
+                            common.gitPush(
+                                    branch: "master",
+                                    commit_msg: "Update K8s manifests for ${args.serviceName}-${integrationStage}-${env.NEW_IMAGE_TAG}. Service Commit: ${env.COMMIT_ID}",
+                                    tag: gitTag
+                            )
+                            echo "Created git tag: ${gitTag}"
+                        }
+                    }
+                }
+            }
+            if (env.GIT_BRANCH == "next") {
+
+                stage('Helm Generation for All Environments') {
+                    container("helm") {
+                        dir('exotel_configs') {
+                            echo "DEBUG: Cloning exotel_configs repository"
+                            echo "DEBUG: Repository URL: git@bitbucket.org:Exotel/exotel_configs.git"
+                            echo "DEBUG: Branch: ${args.exotelConfigBranch}"
+                            echo "DEBUG: Credential: cicd-exotel"
+                            common.sparseCheckout(
+                                    url: "git@bitbucket.org:Exotel/exotel_configs.git",
+                                    branch: "${args.exotelConfigBranch}",
+                                    credential_key: "cicd-exotel"
+                            )
+                            echo "DEBUG: Successfully cloned exotel_configs from branch: ${args.exotelConfigBranch}"
+                        }
+
+                        dir(args.configFilePath) {
+                            sh """
+                            echo "DEBUG: Copying k8s contents to current directory..."
+                            cp -rf k8s/* .
+                            
+                            echo "DEBUG: Using image tag for Helm: ${env.NEW_IMAGE_TAG}"
+                            
+                            echo "DEBUG: Generating qa_us3.yaml from values.qa_us3.yaml"
+                            helm template --name ${
+                                args.serviceName
+                            } . -f values/values.qa_us3.yaml --set=image.tag="${
+                                env.NEW_IMAGE_TAG
+                            }" --set=configs.commit_id="${env.CONFIG_COMMIT_SHA}" --set=service_image.commit_id="${
+                                env.GIT_COMMIT_ID
+                            }" ${args.additionalHelmFlags} > ${args.serviceName}-qa_us3.yaml
+
+                            echo "DEBUG: Generating prod.yaml from values.prod.yaml"
+                            helm template --name ${
+                                args.serviceName
+                            } . -f values/values.prod.yaml --set=image.tag="${
+                                env.NEW_IMAGE_TAG
+                            }" --set=configs.commit_id="${env.CONFIG_COMMIT_SHA}" --set=service_image.commit_id="${
+                                env.GIT_COMMIT_ID
+                            }" ${args.additionalHelmFlags} > ${args.serviceName}-prod.yaml
+
+                            echo "DEBUG: Generating mum1.yaml from values.mum1.yaml"
+                            helm template --name ${
+                                args.serviceName
+                            } . -f values/values.mum1.yaml --set=image.tag="${
+                                env.NEW_IMAGE_TAG
+                            }" --set=configs.commit_id="${env.CONFIG_COMMIT_SHA}" --set=service_image.commit_id="${
+                                env.GIT_COMMIT_ID
+                            }" ${args.additionalHelmFlags} > ${args.serviceName}-mum1.yaml
+
+                            echo "DEBUG: Generated files:"
+                            ls -la ${args.serviceName}-*.yaml
+                            """
+                        }
+                        sh """
+                        mkdir -p exotel_deployments/${args.serviceName}/qa_us3/
+                        mkdir -p exotel_deployments/${args.serviceName}/prod/
+                        mkdir -p exotel_deployments/${args.serviceName}/mum1/
+                        
+                        mv ${args.configFilePath}/${args.serviceName}-qa_us3.yaml exotel_deployments/${
+                            args.serviceName
+                        }/qa_us3/
+                        
+                        mv ${args.configFilePath}/${args.serviceName}-prod.yaml exotel_deployments/${
+                            args.serviceName
+                        }/prod/
+                        
+                        mv ${args.configFilePath}/${args.serviceName}-mum1.yaml exotel_deployments/${
+                            args.serviceName
+                        }/mum1/
+                        
+                        echo "DEBUG: All deployment files created:"
+                        ls -la exotel_deployments/${args.serviceName}/*/
+                        """
+                    }
+                }
+                stage('Commit All Deployment Files') {
+                    sshagent(['cicd-exotel']) {
+                        dir("exotel_deployments") {
+                            // Use simple tagging
+                            def gitTag = "${args.serviceName}-${env.NEW_IMAGE_TAG}-${env.COMMIT_ID}-${label}"
+                            common.gitPush(
+                                    branch: "master",
+                                    commit_msg: "Update K8s manifests for ${args.serviceName} (qa_us3, prod, mum1) - ${env.NEW_IMAGE_TAG}. Service Commit: ${env.COMMIT_ID}",
+                                    tag: gitTag
+                            )
+                            echo "Created git tag: ${gitTag}"
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+}
+
+---
+
+# /Users/shashidhara.reddy/jenkins-pipeline/src/io/estrado/pipelines/HelmGenerationPipeline.groovy
+
+package io.estrado.pipelines
+
+import io.estrado.artifact.Artifactory
+import io.estrado.components.Common
+import io.estrado.components.Docker
+import io.estrado.components.Helm
+
+
+def generateHelm(Map args, Map env) {
+
+    Artifactory ecr = new Artifactory()
+    Common common = new Common()
+    Docker docker = new Docker()
+    Helm helm = new Helm()
+
+    def label = common.workerLabel("${args.serviceName}-helm")
+
+    podTemplate(label: label, namespace: 'infra', serviceAccount: 'jenkins', containers: [
+            containerTemplate(name: 'builder', 
+                        image: 'exotelorg/nerdctl-awscli:v1', 
+                        command: '/bin/sh -c', 
+                        args: 'buildkitd --rootless & sleep 2 && cat', 
+                        ttyEnabled: true, 
+                        privileged: true,
+                        volumeMounts: [mountPath: '/root/.dockerhubsecret', name: 'dockerhub-creds']),
+            containerTemplate(name: 'helm', image: 'exotelorg/k8s-helm', command: 'cat', ttyEnabled: true)
+    ], imagePullSecrets: ['exotelorg-dockerhub-secret'], volumes: [
+            hostPathVolume(mountPath: '/run/containerd', hostPath: '/run/containerd'),
+            hostPathVolume(mountPath: '/var/lib/containerd', hostPath: '/var/lib/containerd'),
+            hostPathVolume(mountPath: '/var/lib/nerdctl', hostPath: '/var/lib/nerdctl'),
+            hostPathVolume(mountPath: '/opt/cni/bin', hostPath: '/opt/cni/bin'),
+            hostPathVolume(mountPath: '/etc/cni/net.d', hostPath: '/etc/cni/net.d'),
+            secretVolume(secretName: 'exotelorg-dockerhub-secret', mountPath: '/root/.dockerhubsecret', name: 'dockerhub-creds')
+    ]) {
+        node(label) {
+            stage('Source code checkouts') {
+                helm.helmCheckout()
+            }
+            println "Athavan ${commonVars.GIT_BRANCH}"
+            println  env
+            stage('Fetch Latest Tag'){
+                container('builder'){
+                    env.NEW_IMAGE_TAG  = ecr.getLatestTagForHelm()
+                }
+            }
+            if (env.GIT_BRANCH == "pu") {
+
+                stage('Helm Generation for Integration'){
+                    container("helm"){
+                        dir(args.configFilePath){
+                            sh """
+                            ls *
+                            cp -rf * k8s/
+                            cd k8s/
+                            helm template --name ${args.serviceName} -f values/values.${integrationStage}.yaml \
+                                --set=service_image.tag=${env.NEW_IMAGE_TAG} \
+                                --set=configs.commit_id=${env.CONFIG_COMMIT_SHA} \
+                                --set=service_image.commit_id=${env.GIT_COMMIT_ID} > ${args.serviceName}-${integrationStage}.yaml
+                            
+                            """
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+---
+
+# /Users/shashidhara.reddy/jenkins-pipeline/src/io/estrado/vars/InitSteps.groovy
+
+package io.estrado.vars
+
+---
