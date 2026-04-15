@@ -1,0 +1,493 @@
+# VoIP / SIP — Learn, Build, Break, Drill (Debian 12)
+
+**Distro:** **Debian 12** (`apt`, `systemd`, `nftables`). Ubuntu LTS is ~identical.  
+**Reference book:** Carla Schroder, *Linux Networking Cookbook* (O'Reilly) — for Linux networking underneath VoIP. JD↔book map in **§10**.
+
+---
+
+## §1 — High-level flow: what happens on a phone call
+
+Before any component names, understand the **two things** that must happen for a voice call to work:
+
+1. **Signaling** — text messages (SIP) that say "I want to call X", "ringing", "answered", "hang up". Think of it like **sending letters** to set up a meeting. Uses **port 5060** (UDP/TCP) or **5061** (TLS).
+
+2. **Media** — the actual **voice audio** streaming as tiny UDP packets (RTP). Think of it as the **actual conversation** once the meeting starts. Uses **high UDP ports** (e.g. 10000–20000).
+
+These travel on **different paths** and can **break independently**. A call can "connect" (signaling OK) but have **no audio** (media broken).
+
+### What happens step by step (simplified)
+
+1. **You dial a number** on a phone or softphone.
+2. Your phone sends a **SIP INVITE** (signaling) to the **proxy/registrar** (Kamailio).
+3. Kamailio **routes** the INVITE — maybe to an **IVR** (Asterisk), maybe toward a **carrier** (PSTN).
+4. Inside the INVITE is an **SDP body** that says: "Send my audio to **this IP:port**, I speak **these codecs**."
+5. If there's NAT (phone is behind a router), the IP in SDP is **private/wrong**. **RTPengine** rewrites SDP with a **public relay** address and **relays** the UDP audio.
+6. The other side answers (**200 OK** + their SDP). Now both sides know where to send audio.
+7. **RTP** flows: voice packets stream between phones (often **through** RTPengine as relay).
+8. Someone hangs up → **BYE** → RTPengine cleans up relay state.
+
+### Diagram
+
+```mermaid
+flowchart LR
+  subgraph sig [Signaling path SIP]
+    Phone[Your phone] -->|INVITE| SBC_opt["SBC (optional)"]
+    SBC_opt -->|INVITE| Kam[Kamailio]
+    Kam -->|INVITE| Ast[Asterisk / app]
+    Ast -->|INVITE| Carrier[Carrier PSTN]
+  end
+  subgraph med [Media path RTP]
+    Phone -.->|voice UDP| RTP[RTPengine relay]
+    RTP -.->|voice UDP| Carrier
+  end
+  Kam -->|"ng control (offer/answer/delete)"| RTP
+```
+
+**Key insight for interviews:** When someone says "call failed", your **first** question is: did **signaling** fail (no ring, error code) or did **media** fail (connected but no audio)? They are **different problems** with **different tools**.
+
+---
+
+## §2 — What each component is, why it exists, tradeoffs
+
+### SIP phone / softphone
+
+**What:** The **endpoint** — a hardware desk phone, mobile app, or desktop app that speaks SIP and sends/receives RTP audio.  
+**Why you need it:** Without endpoints there's nobody to call.  
+**Tradeoff:** Hardware phones are **reliable** but costly; softphones are **free** but depend on OS audio stack and network quality.
+
+### SIP carrier / PSTN gateway
+
+**What:** The **other side's network** that connects your VoIP world to the traditional phone network (or another SIP network). They sell you **phone numbers (DIDs)** and **call capacity (channels, CPS)**.  
+**Why you need it:** Without a carrier, you can only call other phones on your own system.  
+**Tradeoff:** More carriers = **redundancy** but more **peering configs** to maintain. Each carrier has its own quirks (codec preferences, CLI rules, timers).
+
+### SBC (Session Border Controller)
+
+**What:** A **network edge device** that sits between your internal VoIP and the outside world. It enforces **security** (TLS, rate limits, fraud detection), **hides** your internal topology, and handles **interop** between different SIP implementations. Often works as a **B2BUA** (terminates one SIP dialog and creates a new one inward).  
+**Why you need it:** Without it, your Kamailio/Asterisk is **directly exposed** to the Internet — every scanner, every malformed packet.  
+**Without it:** You can survive without an SBC in **small/internal** deployments; Kamailio can do some edge security. But carrier-grade or multi-carrier setups almost always use one.  
+**Tradeoff:** **Cost** (commercial SBCs are expensive) and **complexity** (another hop, another config) vs **security and interop** stability.
+
+### Kamailio
+
+**What:** A **SIP proxy, registrar, and router**. It handles SIP messages at **high scale**: thousands of registrations, INVITE routing, load balancing (dispatcher module), NAT-related header fixes, and peering with carriers.  
+**Why you need it:** Asterisk alone can't handle **thousands of concurrent SIP registrations** efficiently. Kamailio is **lightweight** — it just moves SIP messages, it doesn't process audio.  
+**Does NOT do:** IVR menus, voicemail, conferencing, music on hold — that's Asterisk.  
+**Tradeoff:** Kamailio at the **edge** gives you **scale** and **security** but its config language is low-level (not friendly for call logic). Asterisk at the edge is **simpler** for small setups but **won't scale** for carrier loads.
+
+### Asterisk
+
+**What:** A **PBX and application server**. It runs **dialplans** (call routing logic), **IVR** menus, **queues**, voicemail, conferencing, and handles media (codec transcoding, recording).  
+**Why you need it:** Someone has to run the **business logic** — ring this queue, play this prompt, record this call. Kamailio can't do that.  
+**Does NOT do:** It's not designed to be the **first Internet-facing** SIP hop at scale — that's Kamailio/SBC territory.  
+**Tradeoff:** Asterisk is **feature-rich** but **heavier** per session than Kamailio. For pure routing without app logic, Kamailio is better. For app logic, Asterisk (or FreeSWITCH) is needed.
+
+### RTPengine
+
+**What:** A **kernel-assisted RTP relay and SDP rewriter**, controlled by Kamailio (via the **ng** control protocol — not SIP). When a phone behind NAT advertises a **private** IP in its SDP, RTPengine **rewrites** that to a **public relay** address and forwards the audio packets.  
+**Why you need it:** Without it, calls between NATed phones and carriers get **one-way audio or no audio** because the SDP addresses are unreachable.  
+**Does NOT do:** Call routing, dialplan, business logic — it **only** handles media relay instructions from Kamailio.  
+**Tradeoff:** **Kernel mode** = very fast forwarding (millions of packets/sec) but needs a **kernel module** that must be rebuilt on every kernel update. **Userspace mode** = simpler but slower under heavy load.
+
+### Homer / SIPCAPTURE
+
+**What:** A **SIP signaling visibility** platform. Agents on your SIP servers send **HEP** (Homer Encapsulation Protocol) copies of SIP messages to Homer's collector for **search, drill-down, and call-flow diagrams**.  
+**Why you need it:** When troubleshooting, you need to see the **SIP ladder** (who sent what, when) across multiple nodes. Homer gives you this without manually running tcpdump everywhere.  
+**Tradeoff:** Another service to run and retain data for; but without it, troubleshooting multi-hop SIP is **painful**.
+
+### Prometheus + Grafana
+
+**What:** **Metrics** collection (Prometheus scrapes HTTP endpoints) + **dashboards and alerts** (Grafana visualizes, Alertmanager fires).  
+**Why you need it:** You want to know **before** users complain that a trunk is returning 503s, or that CPS is spiking, or that RTPengine is dropping packets.  
+**Tradeoff:** Setup and maintenance cost; but without metrics you're **blind** until someone calls to say "phones are down."
+
+### Twilio / Genesys
+
+**What:** **External platforms** you integrate with.  
+- **Twilio:** offers **SIP trunks** (carrier replacement) + **REST APIs** for programmatic call control. Two integration surfaces: **network** (trunk, certs, IP allowlist) + **software** (webhooks, API keys).  
+- **Genesys:** contact center platform with **SIP Server** + **CTI/web** for agent desktops. SIP trunk integration is separate from the web/CTI integration.  
+**Tradeoff:** CPaaS (Twilio) = **fast** to start, **per-minute cost**; traditional carrier = cheaper at scale but more **peering** work.
+
+### PostgreSQL / MongoDB
+
+**What:** **Databases** used for CDRs (call detail records), Kamailio location table (if DB-backed), configs.  
+**Why:** You need to store call history, billing data, and sometimes registrar state.  
+**Tradeoff:** **Not in the RTP path** — but if the DB is slow, **REGISTER** lookups or CDR writes can lag.
+
+### Linux (Debian 12)
+
+**What:** The **OS** running everything. Interfaces, routing tables, `nftables` firewall, kernel module for RTPengine, time sync — half of "voice bugs" are actually **Linux networking bugs**.  
+**Why it matters for interviews:** If you can't explain `ip route`, `nftables`, `conntrack`, or `tcpdump`, you can't debug VoIP.
+
+---
+
+## §3 — SIP, SDP, RTP, RTCP protocols
+
+Now that you know the components, here are the **protocols** they speak.
+
+### SIP (Session Initiation Protocol)
+
+**What:** Text-based signaling (like HTTP). Runs on UDP **5060**, TCP **5060**, or TLS **5061**.  
+**Key messages:** INVITE (start call), ACK (confirm), BYE (end), REGISTER (phone says "I'm here"), OPTIONS (health check / keep-alive), CANCEL (abort ringing).  
+**What breaks:** **Via** and **Contact** headers get mangled by NAT; **TLS** cert mismatches; parsers disagree on edge-case SIP formatting between vendors.
+
+### SDP (Session Description Protocol)
+
+**What:** A text block **inside** SIP messages that describes the media session: **IP address** to send audio to (`c=` line), **port** (`m=` line), **codecs** (payload types), **ptime**, and optional **crypto** attributes for SRTP.  
+**What breaks:** The `c=` line says a **private** IP (e.g. `192.168.1.5`) — the carrier can't reach that. **RTPengine** rewrites it to a **public relay** address. If RTPengine is skipped or misconfigured → **one-way audio**.
+
+### RTP (Real-time Transport Protocol)
+
+**What:** **UDP** packets carrying actual voice audio. Usually on **even-numbered** high ports (e.g. 10000, 10002…). Each packet has a **timestamp**, **sequence number**, **SSRC** (stream identifier), and a **payload** (encoded audio).  
+**What breaks:** Firewalls block the UDP range; NAT rewrites source; **wrong SSRC** after re-INVITE confuses endpoints.
+
+### RTCP (RTP Control Protocol)
+
+**What:** **Companion** to RTP — sends **Sender Reports** and **Receiver Reports** with jitter, loss, and round-trip estimates. Usually on **RTP port + 1**.  
+**Why you care:** RTCP stats → **MOS** (Mean Opinion Score) estimates → you can prove "the network is bad" with data, not guessing.
+
+### SRTP (Secure RTP)
+
+**What:** **Encrypted** RTP. Keys exchanged via SDP (**SDES**) or **DTLS** handshake (WebRTC-style).  
+**What breaks:** Key mismatch between B2BUA legs; one side expects SRTP, the other sends plain RTP → silence.
+
+### Signaling vs media (interview must-know)
+
+SIP can return **200 OK** (call "connected") while RTP **never flows**. Always debug them **separately**: SIP with **sngrep** / SIP trace, RTP with **tcpdump** / Wireshark RTP analysis.
+
+---
+
+## §4 — Install on Debian 12
+
+### 4.0 Base OS prep
+
+```bash
+sudo apt update && sudo apt install -y chrony vim curl tcpdump dnsutils \
+  iproute2 nftables conntrack
+sudo systemctl enable --now chrony
+```
+
+Set **`nofile`** limits for voice daemons in `/etc/security/limits.d/`.
+
+### 4.1 RTPengine (install first — media plane)
+
+- Install from your approved repo (sipwise packages or internal build).
+- Build/load **kernel module** for **current** `uname -r`.
+- `systemctl enable --now ngcp-rtpengine-daemon`
+- Verify: `rtpengine-ctl list` + `journalctl -u '*rtpengine*' -e`
+
+### 4.2 Kamailio (SIP routing)
+
+```bash
+sudo apt install -y kamailio kamailio-mysql-modules kamailio-rtpengine-modules
+sudo kamailio -c -f /etc/kamailio/kamailio.cfg   # config syntax check
+sudo systemctl enable --now kamailio
+```
+
+### 4.3 Asterisk (application layer)
+
+```bash
+sudo apt install -y asterisk asterisk-modules
+sudo asterisk -rx "core show version"
+sudo systemctl enable --now asterisk
+```
+
+### 4.4 SBC / exporters
+
+Vendor SBC per their docs; add **node_exporter** on voice hosts for Prometheus.
+
+### Cold start order
+
+**OS** (§4.0) → **RTPengine** (§4.1) → **Kamailio** (§4.2) → **Asterisk** (§4.3) → **SBC** (§4.4) → **OPTIONS + test call**.
+
+RTPengine first because Kamailio's config references it; Kamailio before Asterisk because Asterisk often registers **to** Kamailio or Kamailio routes **to** Asterisk.
+
+---
+
+## §5 — How integration works (signaling + media flows)
+
+### 5.0 Two planes
+
+| Plane | Protocol | Path | What "integration" means |
+|-------|----------|------|---------------------------|
+| **Signaling** | SIP (5060/5061) | UA ↔ SBC ↔ Kamailio ↔ Asterisk ↔ Carrier | Routing INVITEs, auth, headers, REGISTER |
+| **Media** | RTP/RTCP (high UDP) | UA ↔ RTPengine ↔ Carrier | SDP tells ports/codecs; RTPengine relays UDP |
+
+**Bug pattern:** SIP "works" (200 OK) but media was never wired (firewall, wrong SDP, RTPengine skipped) → **one-way audio**.
+
+### 5.1 Inbound call: carrier → your user
+
+1. Carrier sends **SIP INVITE** to your public IP (SBC or Kamailio).
+2. **SBC** (if present): TLS/cert check, policy, may rewrite headers; passes to Kamailio.
+3. **Kamailio**: matches routing (DID lookup); calls **`rtpengine_offer()`** so SDP gets relay addresses.
+4. Kamailio forwards INVITE to **Asterisk** on internal IP.
+5. **Asterisk**: dialplan decides ring/IVR/queue; sends **200 OK** with SDP.
+6. **RTPengine**: relays RTP between carrier's addresses and phone's addresses.
+7. **BYE** → Kamailio calls **`rtpengine_delete()`** → kernel relay state cleaned up.
+
+### 5.2 Outbound call: your user → carrier
+
+Same chain reversed; RTPengine still engaged so **private phone** gets a public media anchor.
+
+### 5.3 Kamailio ↔ RTPengine
+
+**Not SIP.** Uses **ng** control protocol (UDP or unix socket). Kamailio tells RTPengine: "this call-id: **offer** / **answer** / **delete**."  
+**You configure:** matching **interface labels** (`public` / `internal`) and **port range** in `nftables`.
+
+### 5.4 Kamailio ↔ Asterisk
+
+Plain **SIP routing**: Kamailio relays to Asterisk's socket. Trust internal subnet; strip dangerous headers from the Internet leg. Asterisk's RTP peers must match **post-RTPengine** SDP.
+
+### 5.5 Twilio integration
+
+1. **SIP trunk:** Twilio Termination → your public SBC/Kamailio; IP allowlist on **both** sides (your egress NAT IP, Twilio's IPs).
+2. **REST API:** HTTP webhooks for call control — **different auth** from trunk. Both must work.
+
+### 5.6 Genesys integration
+
+SIP trunk + certs + SBC at edge. **CTI/web** agent desktop is **parallel** — SIP and CTI are separate proofs.
+
+### 5.7 Homer integration
+
+Kamailio sends **HEP** copies of SIP to Homer. Does **not** change routing — pure **visibility** sidecar.
+
+### 5.8 Prometheus/Grafana integration
+
+**Scrape** HTTP metrics from Kamailio/RTPengine exporters + `node_exporter`. **Alerts** on OPTIONS failures, 5xx spikes, REGISTER drops.
+
+### 5.9 Diagram
+
+```mermaid
+flowchart LR
+  subgraph sig [SIP signaling]
+    UA[Phone] --> SBC_opt[SBC] --> Kam[Kamailio] --> Ast[Asterisk] --> Car[Carrier]
+  end
+  subgraph med [RTP media]
+    UA -.->|voice| RTP[RTPengine] -.->|voice| Car
+  end
+  Kam -->|ng control| RTP
+```
+
+---
+
+## §6 — Maintain
+
+| Area | What you do (Debian) |
+|------|----------------------|
+| **Patches** | `apt upgrade` in staging; **`needrestart`**; rebuild RTPengine kernel module on **new kernel**. |
+| **Config** | `/etc/kamailio`, `/etc/asterisk` in **Git**; `kamailio -c` syntax check; `asterisk -rx 'pjsip show endpoints'`. |
+| **Firewall** | `/etc/nftables.conf` in Git; `nft -c -f` dry-run before reload. |
+| **Certs** | `openssl x509 -in fullchain.pem -noout -dates` — automate 60-day warning. |
+| **Logs** | `journalctl -u kamailio -u asterisk --since '1 hour ago'`; rotate PCAP disk. |
+
+**Change window order:** announce → baseline capture → drain/shift → **one layer** change → `ss` + OPTIONS + test call → go/no-go (rollback criterion written **before** change).
+
+---
+
+## §7 — Common issues and why they happen
+
+Now you know the system. Here's **what breaks** and **why** — so you can explain it in interviews, not just recite commands.
+
+### One-way audio
+
+**Why:** Signaling (SIP) completed fine — both sides said "OK". But the **SDP** inside those messages advertised a **private IP** (e.g. 192.168.x.x). The carrier can't send RTP there. If **RTPengine** wasn't invoked, or its **interface** labels were wrong, the SDP was never rewritten. Result: one side sends audio to an unreachable address.  
+**Also caused by:** firewall blocking the **UDP RTP range**; **conntrack** table full (new UDP flows silently dropped); **rp_filter** rejecting asymmetric return packets.
+
+### NAT — why it specifically breaks VoIP
+
+Normal web traffic: client opens TCP, server replies on same connection. NAT works fine.  
+VoIP: SIP opens on port **5060**, but **RTP** opens on a **different** high port — NAT doesn't automatically associate them. The SDP says "send audio to 192.168.1.5:10000" but the outside world can't reach that. **RTPengine** solves this by anchoring both sides to **its own** public addresses.
+
+### TLS / certificate failures
+
+**Why:** SIP over TLS means both sides check certs. If the cert **expired**, the **chain** is incomplete (missing intermediate), the **SAN** doesn't match the SIP domain, or the phone's **clock** is wrong — registration or INVITE fails with "certificate unknown." Happens on weekends because certs expire and nobody notices.
+
+### Capacity: conntrack, CPS, port exhaustion
+
+**Why:** Every RTP stream creates **conntrack** entries in the Linux kernel's connection tracking table. Under load (hundreds of concurrent calls), the table fills up. **New calls silently fail** — no error in SIP, just no audio. Similarly, if CPS (calls per second) exceeds what Kamailio/Asterisk/RTPengine can process, you get **503** responses or **timeouts**.
+
+### Config drift
+
+**Why:** Someone SSH'd into prod Kamailio and edited `kamailio.cfg` by hand. It works. Next deploy from Git **overwrites** the fix. Or worse: staging uses the **Git** version (which lacks the fix) and passes testing, then prod breaks when the hand-edit is lost. Fix: Git is the **only** source of truth; `kamailio -c` lint in CI; Ansible applies configs.
+
+### Kernel module mismatch (RTPengine)
+
+**Why:** Linux kernel updated (security patch, `apt upgrade`). RTPengine's **kernel module** was compiled for the **old** kernel. New kernel loads, module doesn't → RTPengine falls back to **userspace** (slower) or fails entirely. Calls have no media. Fix: rebuild module **before** rebooting; include in patch MOP.
+
+---
+
+## §8 — Networking recipes + commands (Debian 12)
+
+*Schroder recipe style: **You want** → **Solution** → **Commands** → **Discussion**.*
+
+### 8.1 See interfaces and routes
+
+**You want:** Know IPs and which path packets take.
+
+```bash
+ip -br addr show
+ip route show table main
+ip route get 8.8.8.8 from <your_sip_source_ip>
+```
+
+**Discussion:** If `ip route get` from the SIP socket's source IP takes a wrong path, RTP return can break (asymmetric routing).
+
+### 8.2 See who listens on SIP / RTP ports
+
+**You want:** Confirm daemons bound correctly after change.
+
+```bash
+sudo ss -ulpn 'sport = :5060'
+sudo ss -ulpn 'sport = :5061'
+sudo ss -ulpn | grep -E '5060|10000'
+```
+
+**Discussion:** Two daemons fighting for 5060 = second one fails silently. Check `systemd` unit order.
+
+### 8.3 Capture SIP + RTP without filling disk
+
+**You want:** PCAP for one incident.
+
+```bash
+sudo tcpdump -i any -nn -s0 -G 300 -W 3 -w /var/tmp/voip-%H%M.pcap \
+  'udp port 5060 or udp port 5061 or (udp portrange 10000-20000)'
+```
+
+**Discussion:** Match portrange to RTPengine config. SIP over TLS needs session keys or use **sngrep** on cleartext legs.
+
+### 8.4 IPv4 forwarding (RTPengine transit)
+
+**You want:** Host forwards between interfaces.
+
+```bash
+grep net.ipv4.ip_forward /etc/sysctl.d/*.conf /etc/sysctl.conf
+echo 'net.ipv4.ip_forward=1' | sudo tee /etc/sysctl.d/99-ipforward.conf
+sudo sysctl --system
+```
+
+**Discussion:** Blind `ip_forward=1` without firewall is dangerous — always pair with `nftables`.
+
+### 8.5 nftables: allow SIP + RTP range
+
+**You want:** Stateful firewall for VoIP node.
+
+```bash
+sudo nft list ruleset
+```
+
+**Discussion:** `ct state established,related` must allow **return RTP**. Define **exact** RTP range — don't open all of UDP.
+
+### 8.6 conntrack pressure
+
+**You want:** See if NAT/connection table is full.
+
+```bash
+cat /proc/sys/net/netfilter/nf_conntrack_count
+cat /proc/sys/net/netfilter/nf_conntrack_max
+sudo conntrack -C 2>/dev/null || true
+```
+
+**Discussion:** Many short calls spike conntrack. Tune `nf_conntrack_max` and timeouts.
+
+### 8.7 Time sync
+
+**You want:** Stable clock for TLS and log correlation.
+
+```bash
+sudo apt install -y chrony
+systemctl status chrony
+chronyc tracking
+```
+
+**Discussion:** Clock drift → TLS cert validation fails; multi-host trace timestamps don't align.
+
+### 8.8 DNS / SRV for SIP
+
+**You want:** Prove resolver returns expected records.
+
+```bash
+dig +short SRV _sip._udp.example.com
+dig +short A sip.carrier.example.com
+```
+
+**Discussion:** Split DNS (internal vs external) causes "works in office, fails on LTE."
+
+---
+
+## §9 — Scenario Q&A (drill)
+
+### 9.1 One-way audio
+**Scenario:** 200 OK but one side silent.  
+**A:** SDP vs real RTP path; `nft` UDP rules; RTPengine leg config; conntrack / rp_filter.  
+**Commands:** Recipes 8.1–8.3, 8.6.
+
+### 9.2 New trunk this week
+**A:** Lock auth, codecs, DTMF, CPS, CLI, timers; lab → OPTIONS → test DID → canary → full cut.  
+**Commands:** `dig` carrier SRV (8.8); `openssl s_client` for TLS trunk.
+
+### 9.3 Dispatcher all red
+**A:** `kamcmd dispatcher.list`; OPTIONS blocked by nft; bind IP wrong after NIC rename — `ip -br addr`.
+
+### 9.4 RTPengine post-kernel upgrade
+**A:** Kernel module not rebuilt — rebuild, restart, `journalctl`, one test call.
+
+### 9.5 Asterisk inbound NAT
+**A:** PJSIP `externaddr` / `localnet`; often Contact fix belongs in Kamailio for multi-NAT.
+
+### 9.6 TLS Sunday fail
+**A:** cert dates / chain / SAN; `openssl x509 -noout -dates`; chrony drift.
+
+### 9.7 Jitter / underwater audio
+**A:** RTCP stats; DSCP stripped on a hop; reduce unnecessary transcode; endpoint jitter buffer.
+
+### 9.8 SIPp before peak
+**A:** Measure SIP success %, PDD, 5xx, CPU, fds, conntrack — Recipe 8.6.
+
+### 9.9 Grafana minimums
+**A:** OPTIONS per trunk, 5xx rate, REGISTER drop, RTPengine errors, node CPU + conntrack.
+
+### 9.10 Twilio/Genesys "lab works, DC fails"
+**A:** Egress NAT IP ≠ internal host IP on their allowlist; TLS vs UDP; SNI.
+
+### 9.11 Homer hygiene
+**A:** HEP + TTL retention; tcpdump rotation (8.3); filter by Call-ID.
+
+### 9.12 T.38 after upgrade
+**A:** re-INVITE path; RTPengine T.38 build; ATA firmware; canary fax DID.
+
+### 9.13 SIP ALG on-site
+**A:** sngrep proof of Contact corruption; disable ALG or DMZ to SBC; MOP + rollback.
+
+### 9.14 PostgreSQL CDR slow
+**A:** Missing index on `(call_date, src)`; partition by month; vacuum; reporting off replica.
+
+### 9.15 Git drift
+**A:** `kamailio -c` in CI; Ansible apply from pipeline; checksum alert on prod file.
+
+---
+
+## §10 — JD ↔ *Linux Networking Cookbook* (Schroder) study map
+
+Use this to open the book at the right **kind of recipe**, then practice on Debian.
+
+| JD line | Schroder / LNC topic | Practice on Debian |
+|---------|----------------------|---------------------|
+| NAT traversal, call routing | NAT, masquerading, port forwarding, IP forwarding | `sysctl`, `nft` MASQUERADE, SNAT/DNAT for SIP/RTP |
+| Linux admin, patching | Package & service admin, SSH, hardening | `apt`, `needrestart`, `systemctl` |
+| Firewalls, packet filtering | Firewall recipes | `nftables` rules for UDP RTP + 5060/5061 |
+| Routing, subnetting, LB | Static routes, multihoming, policy routing | `ip route`, `ip rule`, asymmetric routing |
+| tcpdump / Wireshark / sngrep | Network troubleshooting, capture | `tcpdump` filters, `ss`, `mtr` |
+| DNS for SIP URIs / SRV | DNS client, resolver | `dig SRV`, `/etc/resolv.conf` |
+| STUN/TURN | NAT traversal chapters | UDP hole punching concepts |
+| QoS / DSCP | Traffic control (`tc`) | `tc` egress classify; DSCP end-to-end |
+| SIPp load testing | Host performance / limits | `ulimit`, `conntrack_max`, `ss` |
+| Prometheus / Grafana | Monitoring spirit | Metrics, graphs, alerting |
+| Twilio / Genesys | TLS, HTTP trust, egress IP | `openssl s_client`, fixed NAT egress |
+| Homer / SIPCAPTURE | Logging discipline | `logrotate`, retention |
+| PostgreSQL / MongoDB | Remote service over network | `ss -tlnp`, PG `listen_addresses`, firewall |
+
+**Interview sentence:** *Schroder's cookbook is how I keep the Linux network deterministic; Kamailio/Asterisk/RTPengine are services on top of that foundation.*
+
+---
+
+*Single file. Order: understand the system → build it → wire it → maintain it → know what breaks → commands → drill → study guide.*
