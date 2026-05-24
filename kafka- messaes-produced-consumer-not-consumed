@@ -1,0 +1,127 @@
+
+
+producer produces but consumers recived nothing
+What's happening
+producer lags show successful publish
+topic: payments
+partation: 2
+offset: 105248
+
+	no producer error
+	consumer is running but	
+		polls empty records 
+		no exceptions
+		no messages recieved
+messages exsist in kafka
+consumer is connected 
+offsets, group behavious, or config is blocking consumption
+
+real production reasons (Most -> least common)
+
+consumer reading from wrong offset(#1 cause)
+kafka reads from committed group offset
+if group already committed last offset
+last committed offset = lates
+
+	kafka assumes everthing is processed -> returns nothing
+messages exsist
+consumer group is already ahead
+
+consuemr started before topic exsisted
+consumer group created first
+kafka stores offset =-1
+topic created later
+offset is not auto-reset
+consumer gets stuck reading nothing
+
+wrong auto.offset.reset
+latest skips exsisting messages
+earliest -> reads from begining (only if no committed offset)
+very common when
+	producer runs first
+	consumer starts later
+
+wrong consumer group name
+even small change creates a new group
+payment-group 
+payment-group-dev
+payment-group-prod
+
+	new group = different offsets
+	leads to "no messages" confusion
+
+producer & consumer suing different topics
+common mistakes:
+	typo (payments vs payments)
+	vesioned names
+	trailing spaces("payments")
+kafka treats them as different topics
+
+acl/ authorization issues
+producers has write permissions
+consumer lack read permissions
+kafka does not throw errors
+consumer keeps polling empty records
+
+consumer assigned wrong partitions
+manual assignment:
+assign(payments-0)
+	producer writes to partations 1,2
+	consumer recevies nothing
+
+consumer poll timeout/rebalance
+processing slower than max.poll.interval.ms
+kafka removes consumer from group
+partitions reassigned elsewhere
+consumer keeps running but owns no partitions
+
+what's acutally happening(high level)
+
+
+producer - topic - partitions - offsets - cg - consumer
+
+					wrong/offset/group - no data
+
+		 	messages exsist in kafka
+kafka is healthy
+offsets & conifg are the problem
+
+debuging
+confirm messages exsist 
+kafka-console-consumer -- topic payments --from-beginnin
+
+	if messages appear -> produces is fine
+
+inspect consumer group
+kafka-consumer-groups --group payment-group --describe
+if lag = 0 but messges exsist -> offest issue
+
+reset offsets (if required)
+--reset-offsets --to-earliest-execute
+
+restart consumer
+
+verify topic & partations
+same topic name 
+same partation count
+no typos
+
+checks ACLS 
+kafka-acls --list --topic payments
+
+check rebalance logs
+look for 
+partations revoked []
+partations assigned []
+consumer has no partations
+
+final answer
+if messages are produced but consumers read nothing.
+	kafka is not broken
+
+the problem is almost always
+	offsets
+	consumer group
+	topic mismatch
+
+
