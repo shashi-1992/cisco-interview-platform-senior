@@ -1,0 +1,73 @@
+one kafka consumer is overloaded while others are idle
+
+what's happening
+you run a kafka consumer group with multiple instances
+kafka should split work evenly, but in reality one consumer is overloaded while other stay idle
+
+even after scaling consumers the system remains slow
+
+why this happens(real causes)
+this is partition skew, not a kafka bug
+
+Uneven key distrubution (most common)
+messages with the same key always go to the same partition.
+if most traffic goes to one key or partition. the consumer it becomes overloaded.
+
+common reasons
+	one hevy coustumer/device
+	null or constant keys
+	poor key choice(eg. timestamp)
+	very few unique keys
+
+too few partations
+if partations < consumers some consumers stay idel
+kafka cannot split one partation across multiple consumers
+
+sticky partation assigment
+kafka tries to keep partations on the same consumer after rebalances
+heavy partations may stick to one consumer, cuasing long-term imbalance
+
+host key inside a partation
+even with balanced partations one dominant key can overloaded a consumer
+
+no parallelsim per partation
+kafka allows one thread per partation
+cpu-heavy or db-heavy processing slow the consumer
+
+what skew looks like
+
+one partation recieves most of the traffic
+consumer owing it is overloaded
+other cosumers stay mostly idle
+
+dubbign steps
+
+check consumer group assigment
+use kafka-consumer-groups --describe to see partation and lag distribution
+
+check partation traffic
+identity partations with high message volume or large-payloads
+
+review messges keys
+ensure keys re evenly distributed and high-cardinaliyt
+
+inspect consumer processing
+look for slow db calls or heavy cpu work
+
+compare partations vs consumers
+partitions should be greater than or equal to consumers
+
+how to fix it (archtect solutions)
+
+inrease partition count(most effective)
+imporve key design (avoid null, constant, timestamp key)
+tune partition assignor(range or cooperativsticky)
+add internal parallelsim(worker threads, async processing)
+force rebalance(restart or redeploy consumers)
+use kafka strams repartiton when applicable
+
+takeaway
+kafka scales by partitons not consumers
+balanced keys and enough partitons are the key to even load distribution
+
+
