@@ -1,0 +1,164 @@
+How to maintian oreder of messages in kafk topic
+max.in.fligh.requests.per.connection=1 This controls how many messages the producer will send to the server without receving responses
+in.flight.requests.per.session to 1 ensures that additional messages won't be sent while a message batch is retrying
+
+HOw to manage offset in kafka
+consumerrebalancelistener
+consumer.seek(partition, getOffsetFromDNB(partition))
+
+Tune producer performance
+
+batch size- how many bytes of data to collect, before sending messages to the kafka broker.
+linger.ms group the messages and send togethre
+seralise
+compress data 
+higher batch size or lingerms ==> higher throughput but high latency
+
+ack 0 throughput high latency low
+ack 1 throughput medium latency medium
+ack -1 throughput low latency high
+
+tune performance of kafka consumer
+commitsync- low throughput but reliable data
+commitasync High Throughput but non reliable data
+
+assign and seek in kafka consumer
+assign and seek
+assign manually recive data from partation
+seek method of tell consumer to get data fromparticular offset
+proccess record stored in db with id and make the commit(make the data idempotent) better catch is tell broker to get data from the particular offset catch point again batch or single for latency automatic way of setting
+how consumer get partation (offset also)
+
+revoke commit it and go down 
+onpoatation assigned retrive data from given offset seek method 
+__consumer_offsets__ stored in all the brokers
+
+ack and isr in kafka producer
+replication at broker level
+repliction factor and insync replica
+topic level replication
+auto.create.topics.enable = false to set replication at the topic level
+ack = -1 all(sync)
+ack = 1 (async) 
+ack = 0 
+min insync replica means on replica should have repliated data which is leader which have the replicated data
+ send and ack
+ in callback method get acknowledgement at leader
+ send and forget
+
+
+Retries and infligh connection to maintain order in kafka
+to maintain order 
+retries = max
+retry.backoff.ms -> retry and then fails
+max in flight request per connection = 1 
+
+exactly once delivery
+retries = max
+retry.backoff.ms -> retry and  then fails
+max in flight request per conncetionn = 1
+ack = all
+min.insync.replicas=2
+
+kafka > 2
+idempotent=true
+min.insync.replicas=2
+
+consumer lag growing to millions
+
+What's happening
+* are healthy * consumer group can't keep up lag grows *continousely(thousand - millions)
+
+ex producers -> topic(12partations) -> consumer group (4 consumers)
+
+obeseved * one consumer veryslow * some partations huge lag
+* other -> zero lag
+
+consumpation rate < production rate -> leg grows indefinitely
+
+why it happens (real causes)
+partation skew
+kafka reaads per partaiton
+one hot partation get most messages
+only one consumer handles it -> lag explodes
+
+slow consumer processing
+db writes, http calls sync i/o
+hevay conputation
+ineffecient deserialization
+N + 1 queries evne 50 - 100 ms/msg = cannot keep up
+
+poll loop issues
+consumer spends too long processing
+max.poll.interval.ms exceeded
+rebalances triggred -> more lag
+
+low thorughput config
+small max.poll.records
+small fetch sizes
+
+broker pressure (rare)
+Disk i/o 
+network latency
+under-replicated partations
+
+
+partaion skew visulization topic partation
+p0p1p2p3p4p5p6{p7p8} p9 p10
+
+
+consumers:
+c1 c2 c3 c3
+    ^
+ all good lagging(p7)
+
+one slow consumer = overall lag
+
+how to debug issues
+check lag
+kafka-consumer groups.sh --describe --group <group>
+
+identify hot partation
+identity owning consumer
+
+measure processing time
+time per messages
+if > 80ms lag gauranteed
+
+verify poll behavious
+look for rebalance logs
+check max.poll.interval.ms
+
+check dependencies 
+db latency 
+api delays
+thread pool saturation
+
+tune consumer config
+max.poll.records = 500
+fetch.min.bytes = 1MB
+fectch.max.wiat.ms = 50
+
+check broker health
+isr shrink
+disk/network issues
+
+behind the scenes (why lag grows)
+
+lag = latest offset - commited offset
+
+lag increases when
+processing slow - offests commit late - hot paration block one consumer 
+
+kafka doesn't push data 
+if you don't poll + process fast - > messages pile up
+
+offest slow example 
+lastes offest: 150000
+commited offset: 106000000
+
+slow processing -< slow commit -> massive lag
+
+final insight
+kafka lag is almost never a kafka problem
+it's paration skew, slow processing, poor polling or bad configs
