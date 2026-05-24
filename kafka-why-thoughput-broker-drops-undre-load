@@ -1,0 +1,60 @@
+kafka producer throughput drops under load
+
+wht happening
+producer works fine at low traffic
+as load incerases
+	messages/sec drops
+	latency spikes
+	pipeline slows down
+the usally means batching is breaking or brokers are under pressure
+
+root causes(in ordre of reality)
+
+batching stops working
+batch.size too small -> many tiny rquests
+linger.ms = 0 -> no time to form batches
+
+poor batching = low throughput
+
+slow achnowledgments
+
+acks=all waits for all replicas
+isr shrinking or slow follower
+leader waiting too long
+
+slow acks = slow producer
+
+compression disabled or misconfigured 
+
+no compression -> huge network usage
+under load, network becomes bottleneck
+
+use lz4, snappy, szfd
+
+broker disk i/o saturation
+disk can't flush fast enough
+page cache pressure
+high write latency
+
+producer slows becuase brokers can't keep up
+
+network bottlenecks
+packet drops 
+high latency
+saturated bandwidth
+
+appears only at high traffic
+
+quick fix checcklist
+increase batch.size
+set linger.ms (5-20ms)
+monitor broker disk & cpu
+check isr & follower lag
+verify network througput
+
+one-line summary(interview)
+producer throughput drops under load when batching or brokers can't keep up i check size, llinger.ms acks, and broker i/o in that order
+
+
+
+
