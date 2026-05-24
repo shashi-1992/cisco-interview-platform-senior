@@ -1,0 +1,86 @@
+kafka up but producers see frequent timeouts
+
+what's happening
+kafka brokers are running and topics exist
+but producers throw errors like
+
+timeoutexecption: failed to update metadata
+request timedout after 30000ms 
+
+this means
+producer cannot get acknowledgments in time even though kafka locks "healty"
+
+real reasons this happens
+broker overloaded (most common)
+under heavy load, brokers respond slowly:
+causes;
+high cpu usage
+disk i/o saturation
+busy network threads
+
+symptoms:
+high producer latency
+slow request warnings in broker logs
+
+fix:
+	check broker cpu, disk, network
+	add brokers if undreprovisioned
+	balance partiations evenly
+
+isr shrink/ under-replicated partations
+with acks=all producer waits for all isr replicas
+if a follower is slow or offline
+	isr shrinks
+	acks take longer
+	producer times out
+check:
+kafka-topics --describe
+fix:
+	investigate slow followers
+	ensure enough broker resources
+	temporarily use acks=1 if nedded
+
+network latency or connectivyt issues
+under load:
+latency spikes
+packert drops
+tcp retries increase
+
+producer waits -> hits timeout.
+fix:
+	check latency to brokers
+	inspecct vpc/vpn/firewall
+	increase request.timeout.ms if spikes are expected
+
+controller/leader elections issues
+controller manages partation leaders.
+during:
+	broker restarts
+	broker flaps
+leaders change -> producers sends old leader -> timeout.
+symptoms:
+	timeout during redeploys
+	logs show leader election events
+fix:
+	check controller logs
+	avoid simulateneous broker restarts
+	enusure proper replication and isr setting
+
+How producer sees the timeout
+producer -> broker leader
+broker writed -> replicates -> send ack
+timeout happens if ack is delayed due to:
+	broker overload
+	isr shrink
+	network latency
+	leader change
+debugging
+check producer configs (acks, request.timeout.ms)
+check broker cpu, disk, network
+look for under-replicated partitions
+verify isr stability
+checck network latency & packet loss
+inspect controller & leader election logs
+
+summary
+"producer timeouts usually happen due to broker overload, sr instabality network latency, or leader elections kafka may be up, but acknowledgments are delayed"
