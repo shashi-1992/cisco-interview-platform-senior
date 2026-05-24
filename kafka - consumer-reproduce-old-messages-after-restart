@@ -1,0 +1,89 @@
+why does consumer reprocess old messaes after restart?
+
+what's happening
+the consumer process messages normally and logs success.
+after a restart (deploy, crash, scale) if re-reads older offsets
+
+impact:
+	duplicate DB writes
+	repeated emails/sms
+	replayed bussiness events
+
+this always means offst commits are wrong or missing
+
+why this happens (real produciton causes)
+offsets not committed
+
+enable.auto.commit=false
+maual commitsync() missing
+ -> kafka thinks messages were never processes
+
+auto-commit interval too large
+	app crashes before next auto-commit
+	-> messages in that window replay(crash window)
+
+commit timing is wrong
+commit before processing -> messages loss
+
+incorrect async commits
+commitsync() can overwrite newer offsets
+ -> offst goes backward -> old messages replay
+
+large batch commit at end
+crash mid-batch -> entire batch reprocessed
+
+commit before db write
+	offset committed db fails
+	-> kafka won't resend -> data loss in db
+
+commit inside try block only
+	exception skips commit
+	-> messages replay after restart.
+
+consumer group deleted/expired
+kafka forget offsets
+	-> consumer starts from earliest
+
+what's actually happening(siple view)
+consumer process messages
+	|
+offsets not committed properly
+	|
+crash/restart
+	|
+kafka belives consumer stopped earlier
+	|
+consumer starts from old offset -> replay
+
+debugging
+check group offsets
+kafka-consumer-groups --describe --group <group0>
+
+if commited offset < processes offset -> root caused found.
+
+check logs
+commit failures
+rebalances events
+rebalanceinprogresexpeciton
+
+review commit config
+enable.auto.commit
+auto.commit.interveal.ms
+max.poll.interveal.ms
+
+inspecct commit logs
+commit afer processing
+avoid unordered async commits
+prefer commitsync() for saftey
+
+check batch size & processing time
+long processing -> rebalnce -> commit lost
+
+verify group metadata
+group deletion or expiry resets offsets
+
+takeaway
+if a kafka consumer reprocesses old messages after restart
+kafka is not broken
+	offset commits statergy is broken
+
